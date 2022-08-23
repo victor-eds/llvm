@@ -39,6 +39,8 @@ namespace detail {
 using ContextImplPtr = std::shared_ptr<detail::context_impl>;
 using DeviceImplPtr = std::shared_ptr<detail::device_impl>;
 
+using QueueIdT = size_t;
+
 /// Sets max number of queues supported by FPGA RT.
 static constexpr size_t MaxNumQueues = 256;
 
@@ -93,6 +95,7 @@ public:
         MPropList(PropList), MHostQueue(MDevice->is_host()),
         MAssertHappenedBuffer(range<1>{1}),
         MIsInorder(has_property<property::queue::in_order>()),
+        MUniqueID(nextUniqueID()),
         MDiscardEvents(
             has_property<ext::oneapi::property::queue::discard_events>()),
         MIsProfilingEnabled(has_property<property::queue::enable_profiling>()),
@@ -136,6 +139,7 @@ public:
       : MContext(Context), MAsyncHandler(AsyncHandler), MPropList(),
         MHostQueue(false), MAssertHappenedBuffer(range<1>{1}),
         MIsInorder(has_property<property::queue::in_order>()),
+        MUniqueID(nextUniqueID()),
         MDiscardEvents(
             has_property<ext::oneapi::property::queue::discard_events>()),
         MIsProfilingEnabled(has_property<property::queue::enable_profiling>()),
@@ -450,6 +454,11 @@ public:
     return MAssertHappenedBuffer;
   }
 
+  /// Get the unique ID identifying this queue.
+  ///
+  /// \return Unique ID identifying this queue.
+  QueueIdT uniqueID() { return MUniqueID; }
+
 protected:
   // template is needed for proper unit testing
   template <typename HandlerType = handler>
@@ -574,6 +583,14 @@ private:
   /// \param Event is the event to be stored
   void addEvent(const event &Event);
 
+  /// Returns a unique ID for the initialization of this queue.
+  ///
+  /// \return Unique ID to identify a queue.
+  QueueIdT nextUniqueID() {
+    static std::atomic_size_t uniqueID{0};
+    return uniqueID++;
+  }
+
   /// Protects all the fields that can be changed by class' methods.
   std::mutex MMutex;
 
@@ -613,6 +630,8 @@ private:
   CG::CGTYPE MLastCGType = CG::CGTYPE::None;
 
   const bool MIsInorder;
+
+  QueueIdT MUniqueID;
 
 public:
   // Queue constructed with the discard_events property

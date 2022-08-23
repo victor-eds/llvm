@@ -193,7 +193,8 @@ public:
   addCG(std::unique_ptr<sycl::detail::CG> CommandGroup,
         sycl::detail::QueueImplPtr Queue,
         std::vector<sycl::detail::Command *> &ToEnqueue) {
-    return MGraphBuilder.addCG(std::move(CommandGroup), Queue, ToEnqueue);
+    return MGraphBuilder.addCG(std::move(CommandGroup), Queue, ToEnqueue)
+        .NewCmd;
   }
 };
 

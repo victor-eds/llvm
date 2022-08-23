@@ -95,6 +95,10 @@ public:
 
   CGTYPE getType() { return MType; }
 
+  std::vector<std::vector<char>> &getArgsStorage() { return MArgsStorage; }
+
+  std::vector<detail::AccessorImplPtr> &getAccStorage() { return MAccStorage; }
+
   virtual ~CG() = default;
 
 private:

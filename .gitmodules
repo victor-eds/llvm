@@ -1,0 +1,3 @@
+[submodule "sycl-jit"]
+	path = sycl-jit
+	url = git@git.office.codeplay.com:research-and-development/sycl-onnx/sycl-onnx-runtime/kernel-fusion.git

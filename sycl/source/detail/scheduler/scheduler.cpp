@@ -92,6 +92,7 @@ EventImplPtr Scheduler::addCG(std::unique_ptr<detail::CG> CommandGroup,
     }
   }
 
+  bool ShouldEnqueue = true;
   {
     WriteLockT Lock(MGraphLock, std::defer_lock);
     acquireWriteLock(Lock);
@@ -102,29 +103,50 @@ EventImplPtr Scheduler::addCG(std::unique_ptr<detail::CG> CommandGroup,
       NewCmd = MGraphBuilder.addCGUpdateHost(std::move(CommandGroup),
                                              DefaultHostQueue, AuxiliaryCmds);
       break;
-    case CG::CodeplayHostTask:
-      NewCmd = MGraphBuilder.addCG(std::move(CommandGroup), DefaultHostQueue,
-                                   AuxiliaryCmds);
+    case CG::CodeplayHostTask: {
+      auto Result = MGraphBuilder.addCG(std::move(CommandGroup),
+                                        DefaultHostQueue, AuxiliaryCmds);
+      NewCmd = Result.NewCmd;
+      ShouldEnqueue = Result.ShouldEnqueue;
       break;
+    }
     default:
-      NewCmd = MGraphBuilder.addCG(std::move(CommandGroup), std::move(Queue),
-                                   AuxiliaryCmds);
+      auto Result = MGraphBuilder.addCG(std::move(CommandGroup),
+                                        std::move(Queue), AuxiliaryCmds);
+      NewCmd = Result.NewCmd;
+      ShouldEnqueue = Result.ShouldEnqueue;
     }
     NewEvent = NewCmd->getEvent();
   }
 
+  if (ShouldEnqueue) {
+    enqueueCommandForCG(NewEvent, AuxiliaryCmds);
+
+    for (auto StreamImplPtr : Streams) {
+      StreamImplPtr->flush();
+    }
+  }
+
+  return NewEvent;
+}
+
+void Scheduler::enqueueCommandForCG(EventImplPtr NewEvent,
+                                    std::vector<Command *> &AuxiliaryCmds) {
   std::vector<Command *> ToCleanUp;
   {
     ReadLockT Lock(MGraphLock);
 
-    Command *NewCmd = static_cast<Command *>(NewEvent->getCommand());
+    Command *NewCmd =
+        (NewEvent) ? static_cast<Command *>(NewEvent->getCommand()) : nullptr;
 
     EnqueueResultT Res;
     bool Enqueued;
 
     auto CleanUp = [&]() {
       if (NewCmd && (NewCmd->MDeps.size() == 0 && NewCmd->MUsers.size() == 0)) {
-        NewEvent->setCommand(nullptr);
+        if (NewEvent) {
+          NewEvent->setCommand(nullptr);
+        }
         delete NewCmd;
       }
     };
@@ -160,12 +182,6 @@ EventImplPtr Scheduler::addCG(std::unique_ptr<detail::CG> CommandGroup,
     }
   }
   cleanupCommands(ToCleanUp);
-
-  for (auto StreamImplPtr : Streams) {
-    StreamImplPtr->flush();
-  }
-
-  return NewEvent;
 }
 
 EventImplPtr Scheduler::addCopyBack(Requirement *Req) {
@@ -470,6 +486,36 @@ void Scheduler::cleanupCommands(const std::vector<Command *> &Cmds) {
     MDeferredCleanupCommands.insert(MDeferredCleanupCommands.end(),
                                     Cmds.begin(), Cmds.end());
   }
+}
+
+void Scheduler::startFusion(QueueIdT queue) {
+  WriteLockT Lock(MGraphLock, std::defer_lock);
+  MGraphBuilder.startFusion(queue);
+}
+
+void Scheduler::cancelFusion(QueueImplPtr queue) {
+  std::vector<Command *> ToEnqueue;
+  {
+    WriteLockT Lock{MGraphLock, std::defer_lock};
+    MGraphBuilder.cancelFusion(queue, ToEnqueue);
+  }
+  enqueueCommandForCG(nullptr, ToEnqueue);
+}
+
+EventImplPtr Scheduler::completeFusion(QueueImplPtr queue) {
+  std::vector<Command *> ToEnqueue;
+  EventImplPtr FusedEvent;
+  {
+    WriteLockT Lock{MGraphLock, std::defer_lock};
+    FusedEvent = MGraphBuilder.completeFusion(queue, ToEnqueue);
+  }
+  enqueueCommandForCG(FusedEvent, ToEnqueue);
+  return FusedEvent;
+}
+
+bool Scheduler::isInFusionMode(QueueIdT queue) {
+  ReadLockT Lock{MGraphLock, std::defer_lock};
+  return MGraphBuilder.isInFusionMode(queue);
 }
 
 } // namespace detail

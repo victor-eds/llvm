@@ -184,6 +184,11 @@ using QueueImplPtr = std::shared_ptr<detail::queue_impl>;
 using EventImplPtr = std::shared_ptr<detail::event_impl>;
 using ContextImplPtr = std::shared_ptr<detail::context_impl>;
 
+using QueueIdT = size_t;
+using CommandPtr = std::unique_ptr<Command>;
+using FusionList = std::vector<CommandPtr>;
+using FusionMap = std::unordered_map<QueueIdT, FusionList>;
+
 /// Memory Object Record
 ///
 /// The MemObjRecord is used in command groups (todo better desc).
@@ -443,6 +448,14 @@ public:
 
   static MemObjRecord *getMemObjRecord(const Requirement *const Req);
 
+  void startFusion(QueueIdT queue);
+
+  void cancelFusion(QueueImplPtr queue);
+
+  EventImplPtr completeFusion(QueueImplPtr queue);
+
+  bool isInFusionMode(QueueIdT queue);
+
   Scheduler();
   ~Scheduler();
 
@@ -461,8 +474,18 @@ protected:
 
   void cleanupCommands(const std::vector<Command *> &Cmds);
 
+  void enqueueCommandForCG(EventImplPtr NewEvent,
+                           std::vector<Command *> &AuxilaryCmds);
+
   static void enqueueLeavesOfReqUnlocked(const Requirement *const Req,
                                          std::vector<Command *> &ToCleanUp);
+
+  // POD struct to convey some additional information from GraphBuilder::addCG
+  // to the Scheduler to support kernel fusion.
+  struct GraphBuildResult {
+    Command *NewCmd;
+    bool ShouldEnqueue;
+  };
 
   /// Graph builder class.
   ///
@@ -478,9 +501,12 @@ protected:
     ///
     /// \sa queue::submit, Scheduler::addCG
     ///
-    /// \return a command that represents command group execution.
-    Command *addCG(std::unique_ptr<detail::CG> CommandGroup, QueueImplPtr Queue,
-                   std::vector<Command *> &ToEnqueue);
+    /// \return a command that represents command group execution and a bool
+    /// indicating whether this command should be enqueued to the graph
+    /// processor right away or not.
+    GraphBuildResult addCG(std::unique_ptr<detail::CG> CommandGroup,
+                           QueueImplPtr Queue,
+                           std::vector<Command *> &ToEnqueue);
 
     /// Registers a \ref CG "command group" that updates host memory to the
     /// latest state.
@@ -508,7 +534,7 @@ protected:
     /// with Event passed and its dependencies.
     void optimize(EventImplPtr Event);
 
-    void cleanupCommand(Command *Cmd);
+    void cleanupCommand(Command *Cmd, bool AllowUnsubmitted = false);
 
     /// Removes finished non-leaf non-alloca commands from the subgraph
     /// (assuming that all its commands have been waited for).
@@ -570,6 +596,15 @@ protected:
                              const DepDesc &Dep,
                              std::vector<Command *> &ToCleanUp);
 
+    void startFusion(QueueIdT queue);
+
+    void cancelFusion(QueueImplPtr queue, std::vector<Command *> &ToEnqueue);
+
+    EventImplPtr completeFusion(QueueImplPtr queue,
+                                std::vector<Command *> &ToEnqueue);
+
+    bool isInFusionMode(QueueIdT queue);
+
     std::vector<SYCLMemObjI *> MMemObjs;
 
   private:
@@ -611,6 +646,12 @@ protected:
                 std::vector<Command *> &ToEnqueue,
                 const bool AddDepsToLeaves = true);
 
+    void createGraphForCommand(ExecCGCommand *NewCmd, CG::CGTYPE CGType,
+                               std::vector<Requirement *> &Reqs,
+                               const std::vector<detail::EventImplPtr> &Events,
+                               QueueImplPtr Queue,
+                               std::vector<Command *> &ToEnqueue);
+
   protected:
     /// Finds a command dependency corresponding to the record.
     DepDesc findDepForRecord(Command *Cmd, MemObjRecord *Record);
@@ -636,10 +677,19 @@ protected:
 
     void markModifiedIfWrite(MemObjRecord *Record, Requirement *Req);
 
+    FusionMap::iterator findFusionList(QueueIdT Id) {
+      return MFusionMap.find(Id);
+    }
+
     /// Used to track commands that need to be visited during graph traversal.
     std::queue<Command *> MCmdsToVisit;
     /// Used to track commands that have been visited during graph traversal.
     std::vector<Command *> MVisitedCmds;
+
+    /// Used to track queues that are in fusion mode and the
+    /// command-groups/kernels submitted for fusion.
+    FusionMap MFusionMap;
+
     /// Prints contents of graph to text file in DOT format
     ///
     /// \param ModeName is a stringified printing mode name to be used

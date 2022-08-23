@@ -212,5 +212,23 @@ bool queue::device_has(aspect Aspect) const {
   // avoid creating sycl object from impl
   return impl->getDeviceImplPtr()->has(Aspect);
 }
+
+void queue::ext_codeplay_start_fusion() {
+  detail::Scheduler::getInstance().startFusion(impl->uniqueID());
+}
+
+void queue::ext_codeplay_cancel_fusion() {
+  detail::Scheduler::getInstance().cancelFusion(impl);
+}
+
+event queue::ext_codeplay_complete_fusion() {
+  auto EventImpl = detail::Scheduler::getInstance().completeFusion(impl);
+  return detail::createSyclObjFromImpl<event>(EventImpl);
+}
+
+bool queue::ext_codeplay_is_in_fusion_mode() {
+  return detail::Scheduler::getInstance().isInFusionMode(impl->uniqueID());
+}
+
 } // __SYCL_INLINE_VER_NAMESPACE(_V1)
 } // namespace sycl

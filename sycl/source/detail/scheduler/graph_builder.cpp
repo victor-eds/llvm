@@ -10,6 +10,7 @@
 #include <detail/context_impl.hpp>
 #include <detail/event_impl.hpp>
 #include <detail/memory_manager.hpp>
+#include <detail/jit_compiler.hpp>
 #include <detail/queue_impl.hpp>
 #include <detail/scheduler/scheduler.hpp>
 #include <detail/sycl_mem_obj_t.hpp>
@@ -887,7 +888,7 @@ Scheduler::GraphBuilder::addEmptyCmd(Command *Cmd, const std::vector<T *> &Reqs,
   return EmptyCmd;
 }
 
-static bool isInteropHostTask(const std::unique_ptr<ExecCGCommand> &Cmd) {
+static bool isInteropHostTask(ExecCGCommand *Cmd) {
   if (Cmd->getCG().getType() != CG::CGTYPE::CodeplayHostTask)
     return false;
 
@@ -917,7 +918,7 @@ static void combineAccessModesOfReqs(std::vector<Requirement *> &Reqs) {
   }
 }
 
-Command *
+Scheduler::GraphBuildResult
 Scheduler::GraphBuilder::addCG(std::unique_ptr<detail::CG> CommandGroup,
                                QueueImplPtr Queue,
                                std::vector<Command *> &ToEnqueue) {
@@ -928,6 +929,24 @@ Scheduler::GraphBuilder::addCG(std::unique_ptr<detail::CG> CommandGroup,
   auto NewCmd = std::make_unique<ExecCGCommand>(std::move(CommandGroup), Queue);
   if (!NewCmd)
     throw runtime_error("Out of host memory", PI_ERROR_OUT_OF_HOST_MEMORY);
+
+  if (isInFusionMode(Queue->uniqueID())) {
+    // TODO(Lukas, ONNX-399): Check necessary conditions if this command-group
+    // can participate in fusion and abort fusion otherwise.
+    auto &FusionList = findFusionList(Queue->uniqueID())->second;
+    FusionList.push_back(std::move(NewCmd));
+    return {FusionList.back().get(), false};
+  }
+
+  createGraphForCommand(NewCmd.get(), CGType, Reqs, Events, Queue, ToEnqueue);
+
+  return {NewCmd.release(), true};
+}
+
+void Scheduler::GraphBuilder::createGraphForCommand(
+    ExecCGCommand *NewCmd, CG::CGTYPE CGType, std::vector<Requirement *> &Reqs,
+    const std::vector<detail::EventImplPtr> &Events, QueueImplPtr Queue,
+    std::vector<Command *> &ToEnqueue) {
 
   if (MPrintOptionsArray[BeforeAddCG])
     printGraphAsDot("before_addCG");
@@ -1010,7 +1029,7 @@ Scheduler::GraphBuilder::addCG(std::unique_ptr<detail::CG> CommandGroup,
     const Requirement *Req = Dep.MDepRequirement;
     MemObjRecord *Record = getMemObjRecord(Req->MSYCLMemObj);
     updateLeaves({Dep.MDepCommand}, Record, Req->MAccessMode, ToCleanUp);
-    addNodeToLeaves(Record, NewCmd.get(), Req->MAccessMode, ToEnqueue);
+    addNodeToLeaves(Record, NewCmd, Req->MAccessMode, ToEnqueue);
   }
 
   // Register all the events as dependencies
@@ -1021,15 +1040,15 @@ Scheduler::GraphBuilder::addCG(std::unique_ptr<detail::CG> CommandGroup,
 
   if (CGType == CG::CGTYPE::CodeplayHostTask)
     NewCmd->MEmptyCmd =
-        addEmptyCmd(NewCmd.get(), NewCmd->getCG().MRequirements, Queue,
+        addEmptyCmd(NewCmd, NewCmd->getCG().MRequirements, Queue,
                     Command::BlockReason::HostTask, ToEnqueue);
 
   if (MPrintOptionsArray[AfterAddCG])
     printGraphAsDot("after_addCG");
 
-  for (Command *Cmd : ToCleanUp)
+  for (Command *Cmd : ToCleanUp) {
     cleanupCommand(Cmd);
-  return NewCmd.release();
+  }
 }
 
 void Scheduler::GraphBuilder::decrementLeafCountersForRecord(
@@ -1158,10 +1177,12 @@ void Scheduler::GraphBuilder::cleanupCommandsForRecord(
   handleVisitedNodes(MVisitedCmds);
 }
 
-void Scheduler::GraphBuilder::cleanupCommand(Command *Cmd) {
+void Scheduler::GraphBuilder::cleanupCommand(Command *Cmd,
+                                             bool AllowUnsubmitted) {
   if (SYCLConfig<SYCL_DISABLE_POST_ENQUEUE_CLEANUP>::get())
     return;
-  assert(Cmd->MLeafCounter == 0 && Cmd->isSuccessfullyEnqueued());
+  assert(Cmd->MLeafCounter == 0 &&
+         (Cmd->isSuccessfullyEnqueued() || AllowUnsubmitted));
   Command::CommandType CmdT = Cmd->getType();
 
   assert(CmdT != Command::ALLOCA && CmdT != Command::ALLOCA_SUB_BUF);
@@ -1385,6 +1406,73 @@ Command *Scheduler::GraphBuilder::connectDepEvent(
   ConnectCmd->MEmptyCmd = EmptyCmd;
 
   return ConnectCmd;
+}
+
+void Scheduler::GraphBuilder::startFusion(QueueIdT queue) {
+  if (isInFusionMode(queue)) {
+    throw sycl::exception{sycl::make_error_code(sycl::errc::invalid),
+                          "Queue already in fusion mode"};
+  }
+  MFusionMap.emplace(std::make_pair(queue, FusionList{}));
+}
+
+void Scheduler::GraphBuilder::cancelFusion(QueueImplPtr Queue,
+                                           std::vector<Command *> &ToEnqueue) {
+  if (!isInFusionMode(Queue->uniqueID())) {
+    throw sycl::exception{
+        sycl::make_error_code(sycl::errc::invalid),
+        "Calling cancel_fusion on a queue not in fusion mode"};
+  }
+  auto FusionList = findFusionList(Queue->uniqueID());
+  auto &CmdList = (*FusionList).second;
+  for (auto &Cmd : CmdList) {
+    // The commands in the fusion list have only been created so far, but have
+    // not had their requirements resolved into addtional commands (allocations,
+    // copies etc.). Resolve the requirements and add all the necessary
+    // auxiliary commands to the list.
+    auto *NewCmd = static_cast<ExecCGCommand *>(Cmd.get());
+    auto &CommandGroup = NewCmd->getCG();
+    std::vector<Requirement *> &Reqs = CommandGroup.MRequirements;
+    const std::vector<detail::EventImplPtr> &Events = CommandGroup.MEvents;
+    const CG::CGTYPE CGType = CommandGroup.getType();
+    createGraphForCommand(NewCmd, CGType, Reqs, Events, Queue, ToEnqueue);
+
+    // Add the command from the fusion list to the list of commands to enqueue.
+    ToEnqueue.push_back(Cmd.release());
+  }
+  // Delete the entry from the fusion map to put the queue out of fusion mode.
+  MFusionMap.erase(FusionList);
+}
+
+EventImplPtr
+Scheduler::GraphBuilder::completeFusion(QueueImplPtr Queue,
+                                        std::vector<Command *> &ToEnqueue) {
+  if (!isInFusionMode(Queue->uniqueID())) {
+    throw sycl::exception{
+        sycl::make_error_code(sycl::errc::invalid),
+        "Calling complete_fusion on a queue not in fusion mode"};
+  }
+  auto FusionList = findFusionList(Queue->uniqueID());
+  auto &CmdList = (*FusionList).second;
+
+  // Call the JIT compiler to perform the fusion.
+  auto FusedCG =
+      detail::jit_compiler::get_instance().fuseKernels(Queue, CmdList);
+  // Clean up the old commands after successfully fusing them.
+  for (auto &OldCmd : CmdList) {
+    cleanupCommand(OldCmd.release(), /* AllowUnsubmitted */ true);
+  }
+  // Delete the entry from the fusion map to put the queue out of fusion mode
+  // before adding the fused command-group.
+  MFusionMap.erase(FusionList);
+
+  auto Result = addCG(std::move(FusedCG), Queue, ToEnqueue);
+
+  return Result.NewCmd->getEvent();
+}
+
+bool Scheduler::GraphBuilder::isInFusionMode(QueueIdT Id) {
+  return findFusionList(Id) != MFusionMap.end();
 }
 
 } // namespace detail

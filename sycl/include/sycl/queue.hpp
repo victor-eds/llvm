@@ -1059,6 +1059,14 @@ public:
         CodeLoc);
   }
 
+  void ext_codeplay_start_fusion();
+
+  void ext_codeplay_cancel_fusion();
+
+  event ext_codeplay_complete_fusion();
+
+  bool ext_codeplay_is_in_fusion_mode();
+
 // Clean KERNELFUNC macros.
 #undef _KERNELFUNCPARAM
 
