@@ -583,7 +583,6 @@ void ArchSpec::SetFlags(const std::string &elf_abi) {
 
 std::string ArchSpec::GetClangTargetCPU() const {
   std::string cpu;
-
   if (IsMIPS()) {
     switch (m_core) {
     case ArchSpec::eCore_mips32:
@@ -630,6 +629,9 @@ std::string ArchSpec::GetClangTargetCPU() const {
       break;
     }
   }
+
+  if (GetTriple().isARM())
+    cpu = GetTriple().getARMCPUForArch("").str();
   return cpu;
 }
 
@@ -1083,7 +1085,7 @@ static bool cores_match(const ArchSpec::Core core1, const ArchSpec::Core core2,
   case ArchSpec::eCore_arm_generic:
     if (enforce_exact_match)
       break;
-    LLVM_FALLTHROUGH;
+    [[fallthrough]];
   case ArchSpec::kCore_arm_any:
     if (core2 >= ArchSpec::kCore_arm_first && core2 <= ArchSpec::kCore_arm_last)
       return true;

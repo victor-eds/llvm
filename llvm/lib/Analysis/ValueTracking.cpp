@@ -1200,7 +1200,7 @@ static void computeKnownBitsFromOperator(const Operator *I,
   case Instruction::PtrToInt:
   case Instruction::IntToPtr:
     // Fall through and handle them the same as zext/trunc.
-    LLVM_FALLTHROUGH;
+    [[fallthrough]];
   case Instruction::ZExt:
   case Instruction::Trunc: {
     Type *SrcTy = I->getOperand(0)->getType();
@@ -1575,9 +1575,45 @@ static void computeKnownBitsFromOperator(const Operator *I,
         RecQ.CxtI = P->getIncomingBlock(u)->getTerminator();
 
         Known2 = KnownBits(BitWidth);
+
         // Recurse, but cap the recursion to one level, because we don't
         // want to waste time spinning around in loops.
         computeKnownBits(IncValue, Known2, MaxAnalysisRecursionDepth - 1, RecQ);
+
+        // If this failed, see if we can use a conditional branch into the phi
+        // to help us determine the range of the value.
+        if (Known2.isUnknown()) {
+          ICmpInst::Predicate Pred;
+          const APInt *RHSC;
+          BasicBlock *TrueSucc, *FalseSucc;
+          // TODO: Use RHS Value and compute range from its known bits.
+          if (match(RecQ.CxtI,
+                    m_Br(m_c_ICmp(Pred, m_Specific(IncValue), m_APInt(RHSC)),
+                         m_BasicBlock(TrueSucc), m_BasicBlock(FalseSucc)))) {
+            // Check for cases of duplicate successors.
+            if ((TrueSucc == P->getParent()) != (FalseSucc == P->getParent())) {
+              // If we're using the false successor, invert the predicate.
+              if (FalseSucc == P->getParent())
+                Pred = CmpInst::getInversePredicate(Pred);
+
+              switch (Pred) {
+              case CmpInst::Predicate::ICMP_EQ:
+                Known2 = KnownBits::makeConstant(*RHSC);
+                break;
+              case CmpInst::Predicate::ICMP_ULE:
+                Known2.Zero.setHighBits(RHSC->countLeadingZeros());
+                break;
+              case CmpInst::Predicate::ICMP_ULT:
+                Known2.Zero.setHighBits((*RHSC - 1).countLeadingZeros());
+                break;
+              default:
+                // TODO - add additional integer predicate handling.
+                break;
+              }
+            }
+          }
+        }
+
         Known = KnownBits::commonBits(Known, Known2);
         // If all bits have been ruled out, there's no need to check
         // more operands.
@@ -2073,7 +2109,7 @@ static bool isPowerOfTwoRecurrence(const PHINode *PN, bool OrZero,
     // power of two is not sufficient, and it has to be a constant.
     if (!match(Start, m_Power2()) || match(Start, m_SignMask()))
       return false;
-    LLVM_FALLTHROUGH;
+    [[fallthrough]];
   case Instruction::UDiv:
     // Divisor must be a power of two.
     // If OrZero is false, cannot guarantee induction variable is non-zero after
@@ -2085,7 +2121,7 @@ static bool isPowerOfTwoRecurrence(const PHINode *PN, bool OrZero,
   case Instruction::AShr:
     if (!match(Start, m_Power2()) || match(Start, m_SignMask()))
       return false;
-    LLVM_FALLTHROUGH;
+    [[fallthrough]];
   case Instruction::LShr:
     return OrZero || Q.IIQ.isExact(BO);
   default:
@@ -3601,7 +3637,7 @@ static bool cannotBeOrderedLessThanZeroImpl(const Value *V,
         (!SignBitOnly || cast<FPMathOperator>(I)->hasNoNaNs()))
       return true;
 
-    LLVM_FALLTHROUGH;
+    [[fallthrough]];
   case Instruction::FAdd:
   case Instruction::FRem:
     return cannotBeOrderedLessThanZeroImpl(I->getOperand(0), TLI, SignBitOnly,
@@ -5137,7 +5173,7 @@ static bool canCreateUndefOrPoison(const Operator *Op, bool PoisonOnly,
         return false;
       }
     }
-    LLVM_FALLTHROUGH;
+    [[fallthrough]];
   case Instruction::CallBr:
   case Instruction::Invoke: {
     const auto *CB = cast<CallBase>(Op);
@@ -6502,7 +6538,8 @@ bool llvm::matchSimpleRecurrence(const PHINode *P, BinaryOperator *&BO,
     case Instruction::Sub:
     case Instruction::And:
     case Instruction::Or:
-    case Instruction::Mul: {
+    case Instruction::Mul:
+    case Instruction::FMul: {
       Value *LL = LU->getOperand(0);
       Value *LR = LU->getOperand(1);
       // Find a recurrence.
