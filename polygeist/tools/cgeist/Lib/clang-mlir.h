@@ -52,6 +52,21 @@ struct LoopContext {
   mlir::Value noBreak;
 };
 
+enum class FunctionContext : unsigned { Host = 0, Device = 1 };
+
+struct FunctionToEmit {
+  enum class Kind {
+    Host,
+    Device,
+  };
+
+  FunctionToEmit(const FunctionDecl *decl, FunctionContext context)
+      : decl(decl), context(context) {}
+
+  const FunctionDecl *decl;
+  FunctionContext context;
+};
+
 struct MLIRASTConsumer : public ASTConsumer {
   std::set<std::string> &emitIfFound;
   std::set<std::string> &done;
@@ -108,9 +123,9 @@ struct MLIRASTConsumer : public ASTConsumer {
 
   ~MLIRASTConsumer() {}
 
-  mlir::func::FuncOp GetOrCreateMLIRFunction(const FunctionDecl *FD,
-                                             const bool ShouldEmit,
-                                             bool getDeviceStub = false);
+  mlir::FunctionOpInterface GetOrCreateMLIRFunction(FunctionToEmit &F,
+                                                    const bool ShouldEmit,
+                                                    bool getDeviceStub = false);
 
   mlir::LLVM::LLVMFuncOp GetOrCreateLLVMFunction(const FunctionDecl *FD);
   mlir::LLVM::LLVMFuncOp GetOrCreateMallocFunction();
@@ -129,7 +144,7 @@ struct MLIRASTConsumer : public ASTConsumer {
   GetOrCreateGlobal(const ValueDecl *VD, std::string prefix,
                     bool tryInit = true);
 
-  std::deque<const FunctionDecl *> functionsToEmit;
+  std::deque<FunctionToEmit> functionsToEmit;
 
   void run();
 
@@ -149,16 +164,18 @@ struct MLIRASTConsumer : public ASTConsumer {
   mlir::Location getMLIRLocation(clang::SourceLocation loc);
 
 private:
-  void setMLIRFunctionAttributes(mlir::func::FuncOp &function,
+  void setMLIRFunctionAttributes(mlir::FunctionOpInterface &function,
                                  const FunctionDecl &FD, LLVM::Linkage lnk,
                                  MLIRContext *ctx) const;
+  llvm::Optional<mlir::FunctionOpInterface>
+  getFunction(const std::string &name, FunctionContext context) const;
 };
 
 class MLIRScanner : public StmtVisitor<MLIRScanner, ValueCategory> {
 private:
   friend class IfScope;
   MLIRASTConsumer &Glob;
-  mlir::func::FuncOp function;
+  mlir::FunctionOpInterface function;
   mlir::OwningOpRef<mlir::ModuleOp> &module;
   mlir::OwningOpRef<mlir::gpu::GPUModuleOp> &deviceModule;
   mlir::OpBuilder builder;
@@ -205,7 +222,7 @@ private:
 
   const clang::FunctionDecl *EmitCallee(const Expr *E);
 
-  mlir::func::FuncOp EmitDirectCallee(const FunctionDecl *FD);
+  mlir::FunctionOpInterface EmitDirectCallee(const FunctionDecl *FD);
 
   std::map<int, mlir::Value> constants;
 
@@ -245,7 +262,7 @@ public:
               mlir::OwningOpRef<mlir::gpu::GPUModuleOp> &deviceModule,
               LowerToInfo &LTInfo);
 
-  void init(mlir::func::FuncOp function, const FunctionDecl *fd);
+  void init(mlir::FunctionOpInterface function, const FunctionToEmit &fd);
 
   void setEntryAndAllocBlock(mlir::Block *B) {
     allocationScope = entryBlock = B;

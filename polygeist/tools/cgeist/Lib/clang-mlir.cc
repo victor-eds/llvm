@@ -161,7 +161,20 @@ void MLIRScanner::initSupportedFunctions() {
                         "5rangeEE3getILi0EEENS3_ILi1EEEv");
 }
 
-void MLIRScanner::init(mlir::func::FuncOp function, const FunctionDecl *fd) {
+static void checkFunctionParent(const FunctionOpInterface F,
+                                FunctionContext Context, const ModuleOp module,
+                                const gpu::GPUModuleOp deviceModule) {
+  assert((Context != FunctionContext::Host || F->getParentOp() == module) &&
+         "New function must be inserted into global module");
+  assert((Context != FunctionContext::Device ||
+          F->getParentOfType<gpu::GPUModuleOp>() == deviceModule) &&
+         "New device function must be inserted into device module");
+}
+
+void MLIRScanner::init(mlir::FunctionOpInterface function,
+                       const FunctionToEmit &f) {
+  const auto *fd = f.decl;
+
   this->function = function;
   this->EmittingFunctionDecl = fd;
 
@@ -171,7 +184,10 @@ void MLIRScanner::init(mlir::func::FuncOp function, const FunctionDecl *fd) {
   }
 
   initSupportedFunctions();
-  setEntryAndAllocBlock(function.addEntryBlock());
+  // This is needed, as GPUFuncOps are already created with an entry block.
+  setEntryAndAllocBlock(isa<gpu::GPUFuncOp>(function)
+                            ? &function.getBlocks().front()
+                            : function.addEntryBlock());
 
   unsigned i = 0;
   if (auto CM = dyn_cast<CXXMethodDecl>(fd)) {
@@ -225,8 +241,9 @@ void MLIRScanner::init(mlir::func::FuncOp function, const FunctionDecl *fd) {
 
   if (fd->hasAttr<CUDAGlobalAttr>() && Glob.CGM.getLangOpts().CUDA &&
       !Glob.CGM.getLangOpts().CUDAIsDevice) {
-    auto deviceStub =
-        Glob.GetOrCreateMLIRFunction(fd, true, /* getDeviceStub */ true);
+    FunctionToEmit F{fd, FunctionContext::Host};
+    auto deviceStub = cast<func::FuncOp>(
+        Glob.GetOrCreateMLIRFunction(F, true, /* getDeviceStub */ true));
     builder.create<func::CallOp>(loc, deviceStub, function.getArguments());
     builder.create<ReturnOp>(loc);
     return;
@@ -331,9 +348,8 @@ void MLIRScanner::init(mlir::func::FuncOp function, const FunctionDecl *fd) {
                    builder.create<mlir::memref::AllocaOp>(loc, type)});
   builder.create<mlir::memref::StoreOp>(loc, truev, loops.back().noBreak);
   builder.create<mlir::memref::StoreOp>(loc, truev, loops.back().keepRunning);
-  if (function.getFunctionType().getResults().size()) {
-    auto type = mlir::MemRefType::get(
-        {}, function.getFunctionType().getResult(0), {}, 0);
+  if (function.getResultTypes().size()) {
+    auto type = mlir::MemRefType::get({}, function.getResultTypes()[0], {}, 0);
     returnVal = builder.create<mlir::memref::AllocaOp>(loc, type);
     if (type.getElementType().isa<mlir::IntegerType, mlir::FloatType>()) {
       builder.create<mlir::memref::StoreOp>(
@@ -388,15 +404,19 @@ void MLIRScanner::init(mlir::func::FuncOp function, const FunctionDecl *fd) {
   }
   Visit(stmt);
 
-  if (function.getFunctionType().getResults().size()) {
+  if (function.getResultTypes().size()) {
+    assert(!isa<gpu::GPUFuncOp>(function) &&
+           "SYCL kernel functions must always have a void return type.");
     mlir::Value vals[1] = {
         builder.create<mlir::memref::LoadOp>(loc, returnVal)};
     builder.create<ReturnOp>(loc, vals);
+  } else if (isa<gpu::GPUFuncOp>(function)) {
+    builder.create<gpu::ReturnOp>(loc);
   } else
     builder.create<ReturnOp>(loc);
 
-  assert(function->getParentOp() == Glob.module.get() &&
-         "New function must be inserted into global module");
+  checkFunctionParent(function, f.context, Glob.module.get(),
+                      Glob.deviceModule.get());
 }
 
 mlir::OpBuilder &MLIRScanner::getBuilder() { return builder; }
@@ -1535,8 +1555,8 @@ ValueCategory MLIRScanner::VisitConstructCommon(clang::CXXConstructExpr *cons,
     }
   }
 
-  auto tocall =
-      Glob.GetOrCreateMLIRFunction(cons->getConstructor(), ShouldEmit);
+  FunctionToEmit F{cons->getConstructor(), mlirclang::inputContext(builder)};
+  auto tocall = cast<func::FuncOp>(Glob.GetOrCreateMLIRFunction(F, ShouldEmit));
 
   SmallVector<std::pair<ValueCategory, clang::Expr *>> args;
   args.emplace_back(make_pair(obj, (clang::Expr *)nullptr));
@@ -4789,8 +4809,28 @@ mlir::Value MLIRASTConsumer::GetOrCreateGlobalLLVMString(
   return globalPtr;
 }
 
-mlir::func::FuncOp MLIRASTConsumer::GetOrCreateMLIRFunction(
-    const FunctionDecl *FD, const bool ShouldEmit, bool getDeviceStub) {
+llvm::Optional<mlir::FunctionOpInterface>
+MLIRASTConsumer::getFunction(const std::string &name,
+                             FunctionContext context) const {
+  const auto find = [&](const auto &map) {
+    const auto Iter = map.find(name);
+    return Iter == map.end()
+               ? llvm::Optional<mlir::FunctionOpInterface>{}
+               : llvm::Optional<mlir::FunctionOpInterface>{Iter->second};
+  };
+  switch (context) {
+  case FunctionContext::Host:
+    return find(functions);
+  case FunctionContext::Device:
+    return find(deviceFunctions);
+  }
+  llvm_unreachable("Invalid function context");
+}
+
+mlir::FunctionOpInterface MLIRASTConsumer::GetOrCreateMLIRFunction(
+    FunctionToEmit &F, const bool ShouldEmit, bool getDeviceStub) {
+  const auto *FD = F.decl;
+
   assert(FD->getTemplatedKind() !=
          FunctionDecl::TemplatedKind::TK_FunctionTemplate);
   assert(
@@ -4859,8 +4899,10 @@ mlir::func::FuncOp MLIRASTConsumer::GetOrCreateMLIRFunction(
   if (!FD->isDefined(Def, /*checkforfriend*/ true))
     Def = FD;
 
-  if (functions.find(name) != functions.end()) {
-    auto function = functions[name];
+  auto &Context = F.context;
+
+  if (auto optFunction = getFunction(name, Context)) {
+    auto function = *optFunction;
 
     if (Def->isThisDeclarationADefinition()) {
       if (LV == llvm::GlobalValue::InternalLinkage ||
@@ -4879,10 +4921,10 @@ mlir::func::FuncOp MLIRASTConsumer::GetOrCreateMLIRFunction(
                 mlir::LLVM::LinkageAttr::get(builder.getContext(), lnk));
       function->setAttrs(attrs.getDictionary(builder.getContext()));
       if (ShouldEmit) {
-        functionsToEmit.push_back(Def);
+        functionsToEmit.emplace_back(Def, Context);
       }
     }
-    assert(function->getParentOp() == module.get());
+    checkFunctionParent(function, Context, module.get(), deviceModule.get());
     return function;
   }
 
@@ -4965,9 +5007,33 @@ mlir::func::FuncOp MLIRASTConsumer::GetOrCreateMLIRFunction(
     }
   }
   mlir::OpBuilder builder(module->getContext());
-  auto funcType = builder.getFunctionType(types, rettypes);
-  mlir::func::FuncOp function = mlir::func::FuncOp(mlir::func::FuncOp::create(
-      getMLIRLocation(FD->getLocation()), name, funcType));
+
+  const auto createFunctionDecl = [&]() -> FunctionOpInterface {
+    const auto insert = [&](auto Function, auto Module, auto &Map) {
+      Module.push_back(Function);
+      Map[name] = Function;
+      return Function;
+    };
+    auto funcType = builder.getFunctionType(types, rettypes);
+    const auto location = getMLIRLocation(FD->getLocation());
+
+    if (FD->hasAttr<SYCLKernelAttr>()) {
+      auto function = builder.create<gpu::GPUFuncOp>(location, name, funcType,
+                                                     TypeRange{}, TypeRange{});
+      Context = FunctionContext::Device;
+
+      return insert(function, *deviceModule, deviceFunctions);
+    }
+    auto function = builder.create<func::FuncOp>(location, name, funcType);
+    switch (Context) {
+    case FunctionContext::Host:
+      return insert(function, *module, functions);
+    case FunctionContext::Device:
+      return insert(function, *deviceModule, deviceFunctions);
+    }
+    llvm_unreachable("Invalid function context");
+  };
+  auto function = createFunctionDecl();
 
   if (LV == llvm::GlobalValue::InternalLinkage ||
       LV == llvm::GlobalValue::PrivateLinkage || !FD->isDefined() ||
@@ -4981,9 +5047,6 @@ mlir::func::FuncOp MLIRASTConsumer::GetOrCreateMLIRFunction(
 
   setMLIRFunctionAttributes(function, *FD, lnk, builder.getContext());
 
-  functions[name] = function;
-  module->push_back(function);
-
   if (Def->isThisDeclarationADefinition()) {
     assert(Def->getTemplatedKind() !=
            FunctionDecl::TemplatedKind::TK_FunctionTemplate);
@@ -4991,18 +5054,19 @@ mlir::func::FuncOp MLIRASTConsumer::GetOrCreateMLIRFunction(
            FunctionDecl::TemplatedKind::
                TK_DependentFunctionTemplateSpecialization);
     if (ShouldEmit) {
-      functionsToEmit.push_back(Def);
+      functionsToEmit.emplace_back(Def, Context);
     }
   } else if (ShouldEmit) {
     emitIfFound.insert(name);
   }
-  assert(function->getParentOp() == module.get());
+  checkFunctionParent(function, Context, module.get(), deviceModule.get());
   return function;
 }
 
 void MLIRASTConsumer::run() {
   while (functionsToEmit.size()) {
-    const FunctionDecl *FD = functionsToEmit.front();
+    auto F = functionsToEmit.front();
+    const auto *FD = F.decl;
 
     LLVM_DEBUG(llvm::dbgs() << "\n-- FUNCTION BEING EMITTED: "
                             << FD->getNameAsString() << " --\n\n";);
@@ -5021,8 +5085,8 @@ void MLIRASTConsumer::run() {
       continue;
     done.insert(name);
     MLIRScanner ms(*this, module, deviceModule, LTInfo);
-    auto Function = GetOrCreateMLIRFunction(FD, true);
-    ms.init(Function, FD);
+    auto Function = GetOrCreateMLIRFunction(F, true);
+    ms.init(Function, F);
 
     LLVM_DEBUG({
       llvm::dbgs() << "\n";
@@ -5032,7 +5096,8 @@ void MLIRASTConsumer::run() {
       if (functionsToEmit.size()) {
         llvm::dbgs() << "-- FUNCTION(S) LEFT TO BE EMITTED --\n";
 
-        for (const auto *FD : functionsToEmit) {
+        for (const auto &F : functionsToEmit) {
+          const auto *FD = F.decl;
           llvm::dbgs() << "  [+] " << FD->getNameAsString() << "(";
           for (unsigned int index = 0; index < FD->getNumParams(); index += 1) {
             printf("%s",
@@ -5107,7 +5172,7 @@ void MLIRASTConsumer::HandleDeclContext(DeclContext *DC) {
     if ((emitIfFound.count("*") && name != "fpclassify" && !fd->isStatic() &&
          externLinkage) ||
         emitIfFound.count(name)) {
-      functionsToEmit.push_back(fd);
+      functionsToEmit.emplace_back(fd, FunctionContext::Host);
     } else {
     }
   }
@@ -5182,7 +5247,7 @@ bool MLIRASTConsumer::HandleTopLevelDecl(DeclGroupRef dg) {
          externLinkage) ||
         emitIfFound.count(name) || fd->hasAttr<OpenCLKernelAttr>() ||
         fd->hasAttr<SYCLDeviceAttr>()) {
-      functionsToEmit.push_back(fd);
+      functionsToEmit.emplace_back(fd, FunctionContext::Host);
     } else {
     }
   }
@@ -5204,10 +5269,9 @@ mlir::Location MLIRASTConsumer::getMLIRLocation(clang::SourceLocation loc) {
   return FileLineColLoc::get(ctx, fileId, lineNumber, colNumber);
 }
 
-void MLIRASTConsumer::setMLIRFunctionAttributes(mlir::func::FuncOp &function,
-                                                const FunctionDecl &FD,
-                                                LLVM::Linkage lnk,
-                                                MLIRContext *ctx) const {
+void MLIRASTConsumer::setMLIRFunctionAttributes(
+    mlir::FunctionOpInterface &function, const FunctionDecl &FD,
+    LLVM::Linkage lnk, MLIRContext *ctx) const {
   bool isSycl = FD.hasAttr<SYCLDeviceAttr>() || FD.hasAttr<SYCLKernelAttr>();
 
   NamedAttrList attrs(function->getAttrDictionary());
@@ -5219,6 +5283,11 @@ void MLIRASTConsumer::setMLIRFunctionAttributes(mlir::func::FuncOp &function,
     // (if we did we would have merge conflicts if we ever update polygeist).
     function->setAttrs(attrs.getDictionary(ctx));
     return;
+  }
+
+  // Mark as kernel.
+  if (FD.hasAttr<SYCLKernelAttr>()) {
+    attrs.set(gpu::GPUDialect::getKernelFuncAttrName(), UnitAttr::get(ctx));
   }
 
   // Calling conventions for SPIRV functions.
@@ -5773,8 +5842,10 @@ public:
   }
 };
 
-mlir::func::FuncOp MLIRScanner::EmitDirectCallee(const FunctionDecl *FD) {
-  return Glob.GetOrCreateMLIRFunction(FD, true);
+mlir::FunctionOpInterface
+MLIRScanner::EmitDirectCallee(const FunctionDecl *FD) {
+  FunctionToEmit F{FD, FunctionContext::Host};
+  return Glob.GetOrCreateMLIRFunction(F, true);
 }
 
 mlir::Location MLIRScanner::getMLIRLocation(clang::SourceLocation loc) {

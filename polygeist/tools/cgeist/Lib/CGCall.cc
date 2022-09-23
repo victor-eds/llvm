@@ -1523,7 +1523,10 @@ ValueCategory MLIRScanner::VisitCallExpr(clang::CallExpr *expr) {
   MLIRScanner::getMangledFuncName(name, callee, Glob.CGM);
   if (isSupportedFunctions(name))
     ShouldEmit = true;
-  auto ToCall = Glob.GetOrCreateMLIRFunction(callee, ShouldEmit);
+  FunctionToEmit F{callee, mlirclang::inputContext(builder)};
+  auto ToCall =
+      dyn_cast<func::FuncOp>(Glob.GetOrCreateMLIRFunction(F, ShouldEmit));
+  assert(ToCall && "Cannot call a SYCL kernel.");
 
   SmallVector<std::pair<ValueCategory, clang::Expr *>> args;
   QualType objType;
