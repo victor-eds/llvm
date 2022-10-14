@@ -475,6 +475,6 @@ with combinations of kernels that should be fused.
 [grid="rows"]
 [options="header"]
 |========================================
-|Rev|Date|Author|Changes
-|1|2022-10-14|Victor Perez|*Initial draft*
+|Rev|Date|Authors|Changes
+|1|2022-10-14|Victor Lomuller, Lukas Sommer and Victor Perez|*Initial draft*
 |========================================
