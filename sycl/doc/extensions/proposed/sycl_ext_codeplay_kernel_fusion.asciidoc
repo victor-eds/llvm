@@ -120,142 +120,6 @@ introduced because the implicit inter-work-group synchronization between the
 execution of two separate kernels is eliminated by fusion. The user must ensure
 that the kernels combined during fusion do not rely on this synchronization.
 
-=== Semantics
-
-==== Synchronization while in Fusion Mode
-
-[NOTE]
-====
-This section follows the same structure as
-https://registry.khronos.org/SYCL/specs/sycl-2020/html/sycl-2020.html#sec:synchronization[its
-homonym in the SYCL standard].
-====
-
-By design, the execution of a SYCL application using our proposed extension
-should produce the same visible results as if the kernels where executed
-regularly. Throughout this section, synchronization rules while in fusion mode
-are described. Note that some scenarios will lead to the sequential submission
-of the kernels in the fusion list, as adherence to the SYCL standard takes a
-
-higher priority than the optimization benefits brought by the kernel fusion.
-
-[NOTE]
-====
-These synchronization rules only apply between calls to
-`queue::ext_codeplay_start_fusion` and `queue::ext_codeplay_complete_fusion`.
-====
-
-===== Synchronization in the SYCL Application
-
-* _Buffer destruction_: In order to adhere to the SYCL standard, destruction of
-  a buffer which is to be accessed by kernels in the fusion list implies an
-  implicit call to `queue::ext_codeplay_cancel_fusion`. This way, the kernels
-  would be executed in submission order, ensuring correct semantics, pending
-  work would be completed and the data would be copied back on completion.
-* _Host accessors_: Similarly, to obtain correct semantics, when a host accessor
-  accessing a buffer to be accessed by a kernel submitted to the fusion list is
-  created, a call to `queue::ext_codeplay_cancel_fusion` is executed to be able
-  to obtain the expected contents of the buffer.
-* _Command group enqueue_: Submission of command groups to (at least)
-  two different queues, of which at least one is in fusion mode, can
-  lead to _circular dependencies_ between the fused kernel and the
-  execution of other command-groups, if the command-groups synchronize
-  via requirements or explicit synchronization. In this context, a
-  circular dependencies arise if any kernel in a fusion list depends
-  on a kernel submitted for execution in a different queue and, at the
-  same time, this depends on another kernel in the fusion list. This
-  causes a circular dependency as the fused kernel would depend on the
-  kernel not in the fusion list and, at the same time, this would
-  depend on the fused kernel.
-+
-Circular dependencies can be caused by device kernels, host tasks or
-explicit memory operations. Implementations must cancel fusion in time
-to avoid such circular dependencies and deadlock of the
-application. The concrete event/submission causing cancellation is
-implementation defined. Implementations could opt to cancel only when
-the submission would create a circular dependency, but are free to do
-so earlier, e.g., on submission of a command-group to another queue
-which synchronizes with a kernel in the fusion list of another queue.
-* _Queue operations_: Calls to queue operations blocking execution of the
-calling thread, such as `sycl::queue::wait()`, must also imply an implicit
-kernel fusion cancellation.
-* _SYCL event objects_: Host synchronization on events returned by a call to
-`queue::submit` while the queue is still in fusion mode would also result on an
-implicit kernel fusion cancellation.  Explicit dependencies (specified by the
-user with `handler::depends_on`) between kernels to be fused must be dropped, as
-the requirement will trivially hold (per work-item) thanks to fusion semantics.
-* _Queue destruction_: As in this extension the queue becomes stateful, the
-destruction of a queue in fusion mode would lead to an implicit kernel fusion
-cancellation.
-
-===== Synchronization in SYCL kernels
-
-Group barriers semantics do not change in the fused kernel and barriers already
-in the unfused kernels are preserved in the fused kernel. Despite this, it is
-worth noting that, in order to introduce synchronization between work items in a
-same work-group executing a fused kernel, a barrier is added between each of the
-kernels being fused. This way, fusing a submission sequence as the one above
-would result in the following one unless the `property::no_barriers` property is
-used:
-
-```c++
-queue.submit([&](handler& cgh){
-  auto accIn1 = bIn1.get_access(cgh);
-  auto accIn2 = bIn2.get_access(cgh);
-  auto accIn3 = bIn3.get_access(cgh);
-  auto accTmp = bTmp.get_access(cgh);
-  auto accOut = bOut.get_access(cgh);
-  cgh.parallel_for<KernelOne>(dataSize,
-  [=](item<1> i) {
-    KernelOne{accIn1, accIn2, accTmp}(i);
-    group_barrier(i.get_group());
-    KernelTwo{accTmp, accIn3, accOut}(i);
-  });
-}
-```
-
-=== Kernel Fusion Limitations
-
-In addition to the cases discussed above, kernel fusion might be canceled by the
-runtime if some undesired scenarios arise. Note that some implementations might
-be more capable/permissive and might not abort fusion in all of these
-cases. Also, whether to abort when a kernel is submitted or when
-`queue::ext_codeplay_complete_fusion` is called will be implementation and
-scenario--dependent.
-
-==== Hierarchical Parallelism
-
-The extension does not support kernels using hierarchical parallelism. Although
-some implementations might want to add support for this kind of kernels.
-
-==== Incompatible ND-ranges of the kernels to fuse
-
-Incompatibility of ND-ranges will be determined by the kernel fusion
-implementation. All implementations should support fusing kernels with the exact
-same ND-ranges, but implementations might cancel fusion as soon as a kernel with
-a different ND-range is submitted.
-
-==== Kernels with different dimensions
-
-Similar to the previous one, it is implementation-defined whether or not to
-support fusing kernels with different dimensionality.
-
-==== Explicit memory operations
-
-Calls to member function of the `handler` class (or their homologous `queue`
-class shortcuts) should abort fusion in any of the following scenarios:
-
-* The command-group calling the explicit memory function explicitly synchronizes
-  (through an event) with one or multiple kernels in the fusion list;
-* One or multiple requirements created by the command-group calling the explicit
-  memory function requires the execution of one or multiple kernels in the
-  fusion list to be satisfied.
-
-==== No intermediate representation
-
-In case any of the kernels to be fused does not count with an accessible
-suitable intermediate representation, kernel fusion is canceled.
-
 === Example
 
 ```c++
@@ -459,6 +323,140 @@ This property can be passed to the `accessor` constructor, giving a more
  `accessors` will inherit this property (unless overridden).
 
 |===
+
+=== Synchronization while in Fusion Mode
+
+[NOTE]
+====
+This section follows the same structure as
+https://registry.khronos.org/SYCL/specs/sycl-2020/html/sycl-2020.html#sec:synchronization[its
+homonym in the SYCL standard].
+====
+
+By design, the execution of a SYCL application using our proposed extension
+should produce the same visible results as if the kernels where executed
+regularly. Throughout this section, synchronization rules while in fusion mode
+are described. Note that some scenarios will lead to the sequential submission
+of the kernels in the fusion list, as adherence to the SYCL standard takes a
+
+higher priority than the optimization benefits brought by the kernel fusion.
+
+[NOTE]
+====
+These synchronization rules only apply between calls to
+`queue::ext_codeplay_start_fusion` and `queue::ext_codeplay_complete_fusion`.
+====
+
+==== Synchronization in the SYCL Application
+
+* _Buffer destruction_: In order to adhere to the SYCL standard, destruction of
+  a buffer which is to be accessed by kernels in the fusion list implies an
+  implicit call to `queue::ext_codeplay_cancel_fusion`. This way, the kernels
+  would be executed in submission order, ensuring correct semantics, pending
+  work would be completed and the data would be copied back on completion.
+* _Host accessors_: Similarly, to obtain correct semantics, when a host accessor
+  accessing a buffer to be accessed by a kernel submitted to the fusion list is
+  created, a call to `queue::ext_codeplay_cancel_fusion` is executed to be able
+  to obtain the expected contents of the buffer.
+* _Command group enqueue_: Submission of command groups to (at least)
+  two different queues, of which at least one is in fusion mode, can
+  lead to _circular dependencies_ between the fused kernel and the
+  execution of other command-groups, if the command-groups synchronize
+  via requirements or explicit synchronization. In this context, a
+  circular dependencies arise if any kernel in a fusion list depends
+  on a kernel submitted for execution in a different queue and, at the
+  same time, this depends on another kernel in the fusion list. This
+  causes a circular dependency as the fused kernel would depend on the
+  kernel not in the fusion list and, at the same time, this would
+  depend on the fused kernel.
++
+Circular dependencies can be caused by device kernels, host tasks or
+explicit memory operations. Implementations must cancel fusion in time
+to avoid such circular dependencies and deadlock of the
+application. The concrete event/submission causing cancellation is
+implementation defined. Implementations could opt to cancel only when
+the submission would create a circular dependency, but are free to do
+so earlier, e.g., on submission of a command-group to another queue
+which synchronizes with a kernel in the fusion list of another queue.
+* _Queue operations_: Calls to queue operations blocking execution of the
+calling thread, such as `sycl::queue::wait()`, must also imply an implicit
+kernel fusion cancellation.
+* _SYCL event objects_: Host synchronization on events returned by a call to
+`queue::submit` while the queue is still in fusion mode would also result on an
+implicit kernel fusion cancellation.  Explicit dependencies (specified by the
+user with `handler::depends_on`) between kernels to be fused must be dropped, as
+the requirement will trivially hold (per work-item) thanks to fusion semantics.
+* _Queue destruction_: As in this extension the queue becomes stateful, the
+destruction of a queue in fusion mode would lead to an implicit kernel fusion
+cancellation.
+
+==== Synchronization in SYCL kernels
+
+Group barriers semantics do not change in the fused kernel and barriers already
+in the unfused kernels are preserved in the fused kernel. Despite this, it is
+worth noting that, in order to introduce synchronization between work items in a
+same work-group executing a fused kernel, a barrier is added between each of the
+kernels being fused. This way, fusing a submission sequence as the one above
+would result in the following one unless the `property::no_barriers` property is
+used:
+
+```c++
+queue.submit([&](handler& cgh){
+  auto accIn1 = bIn1.get_access(cgh);
+  auto accIn2 = bIn2.get_access(cgh);
+  auto accIn3 = bIn3.get_access(cgh);
+  auto accTmp = bTmp.get_access(cgh);
+  auto accOut = bOut.get_access(cgh);
+  cgh.parallel_for<KernelOne>(dataSize,
+  [=](item<1> i) {
+    KernelOne{accIn1, accIn2, accTmp}(i);
+    group_barrier(i.get_group());
+    KernelTwo{accTmp, accIn3, accOut}(i);
+  });
+}
+```
+
+=== Kernel Fusion Limitations
+
+In addition to the cases discussed above, kernel fusion might be canceled by the
+runtime if some undesired scenarios arise. Note that some implementations might
+be more capable/permissive and might not abort fusion in all of these
+cases. Also, whether to abort when a kernel is submitted or when
+`queue::ext_codeplay_complete_fusion` is called will be implementation and
+scenario--dependent.
+
+==== Hierarchical Parallelism
+
+The extension does not support kernels using hierarchical parallelism. Although
+some implementations might want to add support for this kind of kernels.
+
+==== Incompatible ND-ranges of the kernels to fuse
+
+Incompatibility of ND-ranges will be determined by the kernel fusion
+implementation. All implementations should support fusing kernels with the exact
+same ND-ranges, but implementations might cancel fusion as soon as a kernel with
+a different ND-range is submitted.
+
+==== Kernels with different dimensions
+
+Similar to the previous one, it is implementation-defined whether or not to
+support fusing kernels with different dimensionality.
+
+==== Explicit memory operations
+
+Calls to member function of the `handler` class (or their homologous `queue`
+class shortcuts) should abort fusion in any of the following scenarios:
+
+* The command-group calling the explicit memory function explicitly synchronizes
+  (through an event) with one or multiple kernels in the fusion list;
+* One or multiple requirements created by the command-group calling the explicit
+  memory function requires the execution of one or multiple kernels in the
+  fusion list to be satisfied.
+
+==== No intermediate representation
+
+In case any of the kernels to be fused does not count with an accessible
+suitable intermediate representation, kernel fusion is canceled.
 
 == Issues
 
