@@ -458,7 +458,7 @@ class shortcuts) should abort fusion in any of the following scenarios:
 In case any of the kernels to be fused does not count with an accessible
 suitable intermediate representation, kernel fusion is canceled.
 
-== Issues
+== Design Constraints
 
 The biggest constraint for the design stems from the the fact that the
 combination of kernels to be fused is unknown at compile time. This means that,
