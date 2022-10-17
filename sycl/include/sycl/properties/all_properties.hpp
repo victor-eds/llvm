@@ -4,3 +4,4 @@
 #include <sycl/properties/image_properties.hpp>
 #include <sycl/properties/queue_properties.hpp>
 #include <sycl/properties/reduction_properties.hpp>
+#include <sycl/ext/codeplay/fusion_properties.hpp>

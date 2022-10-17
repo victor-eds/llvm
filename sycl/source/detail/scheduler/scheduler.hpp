@@ -452,7 +452,7 @@ public:
 
   void cancelFusion(QueueImplPtr queue);
 
-  EventImplPtr completeFusion(QueueImplPtr queue);
+  EventImplPtr completeFusion(QueueImplPtr queue, const property_list &);
 
   bool isInFusionMode(QueueIdT queue);
 
@@ -601,7 +601,8 @@ protected:
     void cancelFusion(QueueImplPtr queue, std::vector<Command *> &ToEnqueue);
 
     EventImplPtr completeFusion(QueueImplPtr queue,
-                                std::vector<Command *> &ToEnqueue);
+                                std::vector<Command *> &ToEnqueue,
+                                const property_list &);
 
     bool isInFusionMode(QueueIdT queue);
 

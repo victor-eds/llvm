@@ -221,8 +221,9 @@ void queue::ext_codeplay_cancel_fusion() {
   detail::Scheduler::getInstance().cancelFusion(impl);
 }
 
-event queue::ext_codeplay_complete_fusion() {
-  auto EventImpl = detail::Scheduler::getInstance().completeFusion(impl);
+event queue::ext_codeplay_complete_fusion(const property_list &PropList) {
+  auto EventImpl =
+      detail::Scheduler::getInstance().completeFusion(impl, PropList);
   return detail::createSyclObjFromImpl<event>(EventImpl);
 }
 

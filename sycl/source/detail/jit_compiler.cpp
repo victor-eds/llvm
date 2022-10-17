@@ -12,7 +12,9 @@
 #include <detail/kernel_bundle_impl.hpp>
 #include <detail/kernel_impl.hpp>
 #include <detail/queue_impl.hpp>
+#include <detail/sycl_mem_obj_t.hpp>
 #include <sycl/detail/pi.hpp>
+#include <sycl/ext/codeplay/fusion_properties.hpp>
 #include <sycl/kernel_bundle.hpp>
 
 namespace sycl {
@@ -59,9 +61,467 @@ translateArgType(kernel_param_kind_t Kind) {
   }
 }
 
+enum class Promotion { None, Private, Local };
+
+struct PromotionInformation {
+  Promotion PromotionTarget;
+  unsigned KernelIndex;
+  unsigned ArgIndex;
+  Requirement *Definition;
+  NDRDescT NDRange;
+  size_t LocalSize;
+  std::vector<bool> UsedParams;
+};
+
+using PromotionMap = std::unordered_map<SYCLMemObjI *, PromotionInformation>;
+
+static inline void printPerformanceWarning(const std::string &Message) {
+  if (detail::SYCLConfig<detail::SYCL_RT_WARNING_LEVEL>::get() > 0) {
+    std::cerr << "WARNING: " << Message << "\n";
+  }
+}
+
+template <typename Obj> Promotion getPromotionTarget(Obj &&obj) {
+  auto Result = Promotion::None;
+  if (obj.template has_property<ext::codeplay::property::promote_private>()) {
+    Result = Promotion::Private;
+  }
+  if (obj.template has_property<ext::codeplay::property::promote_local>()) {
+    if (Result != Promotion::None) {
+      throw sycl::exception(sycl::make_error_code(sycl::errc::invalid),
+                            "Two contradicting promotion properties on the "
+                            "same buffer/accessor are not allowed.");
+    }
+    Result = Promotion::Local;
+  }
+  return Result;
+}
+
+static Promotion getInternalizationInfo(Requirement *Req) {
+  auto AccPromotion = getPromotionTarget(Req->MPropertyList);
+
+  auto *MemObj = static_cast<sycl::detail::SYCLMemObjT *>(Req->MSYCLMemObj);
+  if (MemObj->getType() != SYCLMemObjI::MemObjType::Buffer) {
+    // We currently do not support promotion on non-buffer memory objects (e.g.,
+    // images).
+    return Promotion::None;
+  }
+  Promotion BuffPromotion = getPromotionTarget(*MemObj);
+  if (AccPromotion != Promotion::None && BuffPromotion != Promotion::None &&
+      AccPromotion != BuffPromotion) {
+    throw sycl::exception(sycl::make_error_code(sycl::errc::invalid),
+                          "Contradicting promotion properties on accessor and "
+                          "underlying buffer are not allowed");
+  }
+  return (AccPromotion != Promotion::None) ? AccPromotion : BuffPromotion;
+}
+
+static std::optional<size_t> getLocalSize(NDRDescT NDRange, Requirement *Req,
+                                          Promotion Target) {
+  auto NumElementsMem = static_cast<SYCLMemObjT *>(Req->MSYCLMemObj)->size();
+  if (Target == Promotion::Private) {
+    auto NumWorkItems = NDRange.GlobalSize.size();
+    // For private internalization, the local size is
+    // (Number of elements in buffer)/(number of work-items)
+    return NumElementsMem / NumWorkItems;
+  } else if (Target == Promotion::Local) {
+    if (NDRange.LocalSize.size() == 0) {
+      // No work-group size provided, cannot calculate the local size
+      // and need to bail out.
+      return {};
+    }
+    auto NumWorkGroups = NDRange.GlobalSize.size() / NDRange.LocalSize.size();
+    // For local internalization, the local size is
+    // (Number of elements in buffer)/(number of work-groups)
+    return NumElementsMem / NumWorkGroups;
+  }
+  return 0;
+}
+
+static bool accessorEquals(Requirement *Req, Requirement *Other) {
+  return Req->MOffset == Other->MOffset &&
+         Req->MAccessRange == Other->MAccessRange &&
+         Req->MMemoryRange == Other->MMemoryRange &&
+         Req->MSYCLMemObj == Other->MSYCLMemObj && Req->MDims == Other->MDims &&
+         Req->MElemSize == Other->MElemSize &&
+         Req->MOffsetInBytes == Other->MOffsetInBytes &&
+         Req->MIsSubBuffer == Other->MIsSubBuffer;
+}
+
+static void resolveInternalization(ArgDesc &Arg, unsigned KernelIndex,
+                                   unsigned ArgFunctionIndex, NDRDescT NDRange,
+                                   PromotionMap &Promotions) {
+  assert(Arg.MType == kernel_param_kind_t::kind_accessor);
+
+  Requirement *Req = static_cast<Requirement *>(Arg.MPtr);
+
+  auto ThisPromotionTarget = getInternalizationInfo(Req);
+  auto ThisLocalSize = getLocalSize(NDRange, Req, ThisPromotionTarget);
+
+  if (Promotions.count(Req->MSYCLMemObj)) {
+    // We previously encountered an accessor for the same buffer.
+    auto &PreviousDefinition = Promotions.at(Req->MSYCLMemObj);
+
+    switch (ThisPromotionTarget) {
+    case Promotion::None: {
+      if (PreviousDefinition.PromotionTarget != Promotion::None) {
+        printPerformanceWarning(
+            "Deactivating previously specified promotion, because this "
+            "accessor does not specify promotion");
+        PreviousDefinition.PromotionTarget = Promotion::None;
+      }
+      return;
+    }
+    case Promotion::Local: {
+      if (PreviousDefinition.PromotionTarget == Promotion::None) {
+        printPerformanceWarning(
+            "Not performing specified local promotion, due to previous "
+            "mismatch or because previous accessor specified no promotion");
+        return;
+      }
+      if (!ThisLocalSize.has_value()) {
+        printPerformanceWarning("Work-group size for local promotion not "
+                                "specified, not performing internalization");
+        PreviousDefinition.PromotionTarget = Promotion::None;
+        return;
+      }
+      if (PreviousDefinition.PromotionTarget == Promotion::Private) {
+        printPerformanceWarning(
+            "Overriding previous private promotion with local promotion");
+        // Recompute the local size for the previous definition with adapted
+        // promotion target.
+        auto NewPrevLocalSize =
+            getLocalSize(PreviousDefinition.NDRange,
+                         PreviousDefinition.Definition, Promotion::Local);
+
+        if (!NewPrevLocalSize.has_value()) {
+          printPerformanceWarning(
+              "Not performing specified local promotion because previous "
+              "kernels did not specify a local size");
+          PreviousDefinition.PromotionTarget = Promotion::None;
+          return;
+        }
+
+        PreviousDefinition.LocalSize = NewPrevLocalSize.value();
+        PreviousDefinition.PromotionTarget = Promotion::Local;
+      }
+      if (PreviousDefinition.LocalSize != ThisLocalSize.value()) {
+        printPerformanceWarning("Not performing specified local promotion due "
+                                "to work-group size mismatch");
+        PreviousDefinition.PromotionTarget = Promotion::None;
+        return;
+      }
+      if (!accessorEquals(Req, PreviousDefinition.Definition)) {
+        printPerformanceWarning("Not performing specified promotion, due to "
+                                "accessor parameter mismatch");
+        PreviousDefinition.PromotionTarget = Promotion::None;
+        return;
+      }
+      return;
+    }
+    case Promotion::Private: {
+      if (PreviousDefinition.PromotionTarget == Promotion::None) {
+        printPerformanceWarning(
+            "Not performing specified private promotion, due to previous "
+            "mismatch or because previous accessor specified no promotion");
+        return;
+      }
+
+      if (PreviousDefinition.PromotionTarget == Promotion::Local) {
+        // Recompute the local size with adapted promotion target.
+        auto ThisLocalSize = getLocalSize(NDRange, Req, Promotion::Local);
+        if (!ThisLocalSize.has_value()) {
+          printPerformanceWarning("Work-group size for local promotion not "
+                                  "specified, not performing internalization");
+          PreviousDefinition.PromotionTarget = Promotion::None;
+          return;
+        }
+
+        if (PreviousDefinition.LocalSize != ThisLocalSize.value()) {
+          printPerformanceWarning(
+              "Not performing specified local promotion due "
+              "to work-group size mismatch");
+          PreviousDefinition.PromotionTarget = Promotion::None;
+          return;
+        }
+
+        if (!accessorEquals(Req, PreviousDefinition.Definition)) {
+          printPerformanceWarning("Not performing local promotion, due to "
+                                  "accessor parameter mismatch");
+          PreviousDefinition.PromotionTarget = Promotion::None;
+          return;
+        }
+
+        printPerformanceWarning(
+            "Performing local internalization instead, because previous "
+            "accessor specified local promotion");
+        return;
+      }
+
+      // Previous accessors also specified private promotion.
+      if (PreviousDefinition.LocalSize != ThisLocalSize.value()) {
+        printPerformanceWarning(
+            "Not performing specified private promotion due "
+            "to work-group size mismatch");
+        PreviousDefinition.PromotionTarget = Promotion::None;
+        return;
+      }
+      if (!accessorEquals(Req, PreviousDefinition.Definition)) {
+        printPerformanceWarning("Not performing specified promotion, due to "
+                                "accessor parameter mismatch");
+        PreviousDefinition.PromotionTarget = Promotion::None;
+        return;
+      }
+      return;
+    }
+    }
+  } else {
+    if (ThisPromotionTarget == Promotion::Local && !ThisLocalSize.has_value()) {
+      printPerformanceWarning("Work-group size for local promotion not "
+                              "specified, not performing internalization");
+      ThisPromotionTarget = Promotion::None;
+      ThisLocalSize = 0;
+    }
+    assert(ThisLocalSize.has_value());
+    Promotions.emplace(Req->MSYCLMemObj,
+                       PromotionInformation{ThisPromotionTarget, KernelIndex,
+                                            ArgFunctionIndex, Req, NDRange,
+                                            ThisLocalSize.value(),
+                                            std::vector<bool>()});
+  }
+}
+
+// Identify a parameter by the argument description, the kernel index and the
+// parameter index in that kernel.
+struct Param {
+  ArgDesc Arg;
+  unsigned KernelIndex;
+  unsigned ArgIndex;
+  bool Used;
+  Param(ArgDesc Argument, unsigned KernelIdx, unsigned ArgIdx, bool InUse)
+      : Arg{Argument}, KernelIndex{KernelIdx}, ArgIndex{ArgIdx}, Used{InUse} {}
+};
+
+using ParamList = std::vector<Param>;
+
+using ParamIterator = std::vector<Param>::iterator;
+
+std::vector<Param>::const_iterator
+detectIdenticalParameter(std::vector<Param> &Params, ArgDesc Arg) {
+  for (auto I = Params.begin(); I < Params.end(); ++I) {
+    // Two arguments of different type can never be identical.
+    if (I->Arg.MType == Arg.MType) {
+      if (Arg.MType == kernel_param_kind_t::kind_pointer ||
+          Arg.MType == kernel_param_kind_t::kind_std_layout) {
+        // Compare size and, if the size is identical, the content byte-by-byte.
+        if ((Arg.MSize == I->Arg.MSize) &&
+            std::memcmp(Arg.MPtr, I->Arg.MPtr, Arg.MSize) == 0) {
+          return I;
+        }
+      } else if (Arg.MType == kernel_param_kind_t::kind_accessor) {
+        Requirement *Req = static_cast<Requirement *>(Arg.MPtr);
+        Requirement *Other = static_cast<Requirement *>(I->Arg.MPtr);
+        if (accessorEquals(Req, Other)) {
+          return I;
+        }
+      }
+    }
+  }
+  return Params.end();
+}
+
+template <typename T, typename F = typename detail::remove_const_t<
+                          typename detail::remove_reference_t<T>>>
+F *storePlainArg(std::vector<std::vector<char>> &ArgStorage, T &&Arg) {
+  ArgStorage.emplace_back(sizeof(T));
+  auto Storage = reinterpret_cast<F *>(ArgStorage.back().data());
+  *Storage = Arg;
+  return Storage;
+}
+
+static ParamIterator preProcessArguments(
+    std::vector<std::vector<char>> &ArgStorage, ParamIterator Arg,
+    PromotionMap &PromotedAccs,
+    std::vector<::jit_compiler::ParameterInternalization> &InternalizeParams,
+    std::vector<::jit_compiler::JITConstant> &JITConstants,
+    ParamList &NonIdenticalParams,
+    ::jit_compiler::ParamIdentList &ParamIdentities) {
+
+  // Unused arguments are still in the list at this point (because we
+  // need them for accessor handling), but there's not pre-processing
+  // that needs to be done.
+  if (!Arg->Used) {
+    return ++Arg;
+  }
+
+  if (Arg->Arg.MType == kernel_param_kind_t::kind_pointer) {
+    // Pointer arguments are only stored in the kernel functor object, which
+    // will go out-of-scope before we execute the fused kernel. Therefore, we
+    // need to copy the pointer (not the memory it's pointing to) to a permanent
+    // location and update the argument.
+    Arg->Arg.MPtr =
+        storePlainArg(ArgStorage, *static_cast<void **>(Arg->Arg.MPtr));
+  }
+  // First check if there's already another parameter with identical
+  // value.
+  auto Identical = detectIdenticalParameter(NonIdenticalParams, Arg->Arg);
+  if (Identical != NonIdenticalParams.end()) {
+    ::jit_compiler::Parameter ThisParam{Arg->KernelIndex, Arg->ArgIndex};
+    ::jit_compiler::Parameter IdenticalParam{Identical->KernelIndex,
+                                             Identical->ArgIndex};
+    ::jit_compiler::ParameterIdentity Identity{ThisParam, IdenticalParam};
+    ParamIdentities.push_back(Identity);
+    return ++Arg;
+  }
+
+  if (Arg->Arg.MType == kernel_param_kind_t::kind_accessor) {
+    // Get local and private promotion information from accessors.
+    Requirement *Req = static_cast<Requirement *>(Arg->Arg.MPtr);
+    auto &Internalization = PromotedAccs.at(Req->MSYCLMemObj);
+    auto PromotionTarget = Internalization.PromotionTarget;
+    if (PromotionTarget == Promotion::Private ||
+        PromotionTarget == Promotion::Local) {
+      // The accessor should be promoted.
+      if (Internalization.KernelIndex == Arg->KernelIndex &&
+          Internalization.ArgIndex == Arg->ArgIndex) {
+        // This is the first accessor for this buffer that should be
+        // internalized.
+        InternalizeParams.emplace_back(
+            ::jit_compiler::Parameter{Arg->KernelIndex, Arg->ArgIndex},
+            (PromotionTarget == Promotion::Private)
+                ? ::jit_compiler::Internalization::Private
+                : ::jit_compiler::Internalization::Local,
+            Internalization.LocalSize);
+        // If an accessor will be promoted, i.e., if it has the promotion
+        // property attached to it, the next three arguments, that are
+        // associated with the accessor (access range, memory range, offset),
+        // must not participate in identical parameter detection or constant
+        // propagation, because their values will change if promotion happens.
+        // Therefore, we can just skip them here, but we need to remember which
+        // of them are used.
+        for (unsigned I = 0; I < 4; ++I) {
+          Internalization.UsedParams.push_back(Arg->Used);
+          ++Arg;
+        }
+      } else {
+        // We have previously encountered an accessor the same buffer, which
+        // should be internalized. We can add parameter identities for the
+        // accessor argument and the next three arguments (range, memory range
+        // and offset, if they are used).
+        unsigned Increment = 0;
+        for (unsigned I = 0; I < 4; ++I) {
+          // If the argument is used in both cases, i.e., on the original
+          // accessor to be internalized, and this one, we can insert a
+          // parameter identity.
+          if (Arg->Used && Internalization.UsedParams[I]) {
+            ::jit_compiler::Parameter ThisParam{Arg->KernelIndex,
+                                                Arg->ArgIndex};
+            ::jit_compiler::Parameter IdenticalParam{
+                Internalization.KernelIndex,
+                Internalization.ArgIndex + Increment};
+            ::jit_compiler::ParameterIdentity Identity{ThisParam,
+                                                       IdenticalParam};
+            ParamIdentities.push_back(Identity);
+          }
+          if (Internalization.UsedParams[I]) {
+            ++Increment;
+          }
+          ++Arg;
+        }
+      }
+      return Arg;
+    } else {
+      // The accessor will not be promoted, so it can participate in identical
+      // parameter detection.
+      NonIdenticalParams.emplace_back(Arg->Arg, Arg->KernelIndex, Arg->ArgIndex,
+                                      true);
+      return ++Arg;
+    }
+  } else if (Arg->Arg.MType == kernel_param_kind_t::kind_std_layout) {
+    // No identical parameter exists, so add this to the list.
+    NonIdenticalParams.emplace_back(Arg->Arg, Arg->KernelIndex, Arg->ArgIndex,
+                                    true);
+    // Propagate values of scalar parameters as constants to the JIT
+    // compiler.
+    JITConstants.emplace_back(
+        ::jit_compiler::Parameter{Arg->KernelIndex, Arg->ArgIndex},
+        Arg->Arg.MPtr, Arg->Arg.MSize);
+    return ++Arg;
+  } else if (Arg->Arg.MType == kernel_param_kind_t::kind_pointer) {
+    // No identical parameter exists, so add this to the list.
+    NonIdenticalParams.emplace_back(Arg->Arg, Arg->KernelIndex, Arg->ArgIndex,
+                                    true);
+    return ++Arg;
+  }
+  return ++Arg;
+}
+
+static void
+updatePromotedArgs(const ::jit_compiler::SYCLKernelInfo &FusedKernelInfo,
+                   NDRDescT NDRange, std::vector<ArgDesc> &FusedArgs,
+                   std::vector<std::vector<char>> &FusedArgStorage) {
+  auto &ArgUsageInfo = FusedKernelInfo.Args.UsageMask;
+  assert(ArgUsageInfo.size() == FusedArgs.size());
+  for (size_t ArgIndex = 0; ArgIndex < ArgUsageInfo.size();) {
+    bool PromotedToPrivate =
+        (ArgUsageInfo[ArgIndex] & ::jit_compiler::ArgUsage::PromotedPrivate);
+    bool PromotedToLocal =
+        (ArgUsageInfo[ArgIndex] & ::jit_compiler::ArgUsage::PromotedLocal);
+    if (PromotedToLocal || PromotedToPrivate) {
+      // For each internalized accessor, we need to override four arguments
+      // (see 'addArgsForGlobalAccessor' in handler.cpp for reference), i.e.,
+      // the pointer itself, plus twice the range and the offset.
+      auto &OldArgDesc = FusedArgs[ArgIndex];
+      assert(OldArgDesc.MType == kernel_param_kind_t::kind_accessor);
+      auto *Req = static_cast<Requirement *>(OldArgDesc.MPtr);
+
+      // The stored args are all three-dimensional, but depending on the
+      // actual number of dimensions of the accessor, only a part of that
+      // argument is later on passed to the kernel.
+      const size_t SizeAccField =
+          sizeof(size_t) * (Req->MDims == 0 ? 1 : Req->MDims);
+      // Compute the local size and use it for the range parameters.
+      auto LocalSize = getLocalSize(NDRange, Req,
+                                    (PromotedToPrivate) ? Promotion::Private
+                                                        : Promotion::Local);
+      range<3> AccessRange{1, 1, LocalSize.value()};
+      auto *RangeArg = storePlainArg(FusedArgStorage, AccessRange);
+      // Use all-zero as the offset
+      id<3> AcessOffset{0, 0, 0};
+      auto *OffsetArg = storePlainArg(FusedArgStorage, AcessOffset);
+
+      // Override the arguments.
+      // 1. Override the pointer with a std-layout argument with 'nullptr' as
+      // value. handler.cpp does the same for local accessors.
+      int SizeInBytes = Req->MElemSize * LocalSize.value();
+      FusedArgs[ArgIndex] =
+          ArgDesc{kernel_param_kind_t::kind_std_layout, nullptr, SizeInBytes,
+                  static_cast<int>(ArgIndex)};
+      ++ArgIndex;
+      // 2. Access Range
+      FusedArgs[ArgIndex] =
+          ArgDesc{kernel_param_kind_t::kind_std_layout, RangeArg,
+                  static_cast<int>(SizeAccField), static_cast<int>(ArgIndex)};
+      ++ArgIndex;
+      // 3. Memory Range
+      FusedArgs[ArgIndex] =
+          ArgDesc{kernel_param_kind_t::kind_std_layout, RangeArg,
+                  static_cast<int>(SizeAccField), static_cast<int>(ArgIndex)};
+      ++ArgIndex;
+      // 4. Offset
+      FusedArgs[ArgIndex] =
+          ArgDesc{kernel_param_kind_t::kind_std_layout, OffsetArg,
+                  static_cast<int>(SizeAccField), static_cast<int>(ArgIndex)};
+      ++ArgIndex;
+    } else {
+      ++ArgIndex;
+    }
+  }
+}
+
 std::unique_ptr<detail::CG>
-jit_compiler::fuseKernels(QueueImplPtr Queue,
-                          detail::FusionList &InputKernels) {
+jit_compiler::fuseKernels(QueueImplPtr Queue, detail::FusionList &InputKernels,
+                          const property_list &PropList) {
   // Retrieve the device binary from each of the input
   // kernels to hand them over to the JIT compiler.
   std::vector<::jit_compiler::SYCLKernelInfo> InputKernelInfo;
@@ -71,9 +531,10 @@ jit_compiler::fuseKernels(QueueImplPtr Queue,
   std::vector<detail::AccessorImplPtr> AccStorage;
   std::vector<Requirement *> Requirements;
   std::vector<detail::EventImplPtr> Events;
-  std::vector<ArgDesc> FusedArgs;
   NDRDescT NDRDesc;
-  int FusedArgIndex = 0;
+  unsigned KernelIndex = 0;
+  ParamList FusedParams;
+  PromotionMap PromotedAccs;
   // TODO(Lukas, ONNX-399): Collect information about streams and auxiliary
   // resources (which contain reductions) and figure out how to fuse them.
   for (auto &RawCmd : InputKernels) {
@@ -83,7 +544,7 @@ jit_compiler::fuseKernels(QueueImplPtr Queue,
     auto *KernelCG = static_cast<CGExecKernel *>(&CG);
 
     auto KernelName = KernelCG->MKernelName;
-    const RTDeviceBinaryImage *DeviceImage;
+    const RTDeviceBinaryImage *DeviceImage = nullptr;
     RT::PiProgram Program = nullptr;
     if (KernelCG->getKernelBundle() != nullptr) {
       // Retrieve the device image from the kernel bundle.
@@ -120,8 +581,8 @@ jit_compiler::fuseKernels(QueueImplPtr Queue,
 
     // Collect information about the arguments of this kernel.
 
-    // Might need to sort the arguments in case they are not already sorted, see
-    // also the similar code in commands.cpp.
+    // Might need to sort the arguments in case they are not already sorted,
+    // see also the similar code in commands.cpp.
     auto Args = KernelCG->MArgs;
     std::sort(Args.begin(), Args.end(), [](const ArgDesc &A, const ArgDesc &B) {
       return A.MIndex < B.MIndex;
@@ -129,16 +590,30 @@ jit_compiler::fuseKernels(QueueImplPtr Queue,
 
     ::jit_compiler::SYCLArgumentDescriptor ArgDescriptor;
     size_t ArgIndex = 0;
+    // The kernel function in SPIR-V will only have the non-eliminated
+    // arguments, so keep track of this "actual" argument index.
+    unsigned ArgFunctionIndex = 0;
     for (auto &Arg : Args) {
       ArgDescriptor.Kinds.push_back(translateArgType(Arg.MType));
       // DPC++ internally uses 'true' to indicate that an argument has been
-      // eliminated, while the JIT compiler uses 'true' to indicate an argument
-      // is used. Translate this here.
-      ArgDescriptor.UsageMask.emplace_back(
-          (EliminatedArgs.empty() || !EliminatedArgs[ArgIndex++]));
-      // Add to the argument list of the fused kernel, but with the correct new
-      // index in the fused kernel.
-      FusedArgs.emplace_back(Arg.MType, Arg.MPtr, Arg.MSize, FusedArgIndex++);
+      // eliminated, while the JIT compiler uses 'true' to indicate an
+      // argument is used. Translate this here.
+      bool Eliminated = !EliminatedArgs.empty() && EliminatedArgs[ArgIndex++];
+      ArgDescriptor.UsageMask.emplace_back(!Eliminated);
+
+      // If the argument has not been eliminated, i.e., is still present on
+      // the kernel function in LLVM-IR/SPIR-V, collect information about the
+      // argument for performance optimizations in the JIT compiler.
+      if (!Eliminated) {
+        if (Arg.MType == kernel_param_kind_t::kind_accessor) {
+          resolveInternalization(Arg, KernelIndex, ArgFunctionIndex,
+                                 KernelCG->MNDRDesc, PromotedAccs);
+        }
+        FusedParams.emplace_back(Arg, KernelIndex, ArgFunctionIndex, true);
+        ++ArgFunctionIndex;
+      } else {
+        FusedParams.emplace_back(Arg, KernelIndex, 0, false);
+      }
     }
 
     // TODO(Lukas, ONNX-399): Check for the correct kernel bundle state of the
@@ -168,25 +643,50 @@ jit_compiler::fuseKernels(QueueImplPtr Queue,
                        KernelCG->getArgsStorage().end());
     AccStorage.insert(AccStorage.end(), KernelCG->getAccStorage().begin(),
                       KernelCG->getAccStorage().end());
-    // TODO(Lukas, ONNX-399): Does the MSharedPtrStorage contain any information
-    // about actual shared pointers beside the kernel bundle and handler impl?
-    // If yes, we might need to copy it here.
+    // TODO(Lukas, ONNX-399): Does the MSharedPtrStorage contain any
+    // information about actual shared pointers beside the kernel bundle and
+    // handler impl? If yes, we might need to copy it here.
     Requirements.insert(Requirements.end(), KernelCG->MRequirements.begin(),
                         KernelCG->MRequirements.end());
     Events.insert(Events.end(), KernelCG->MEvents.begin(),
                   KernelCG->MEvents.end());
+    ++KernelIndex;
   }
 
-  // TODO(Lukas, ONNX-399): Fill the following with useful information about the
-  // kernels.
-  ::jit_compiler::ParamIdentList ParamIdentities;
-  std::vector<::jit_compiler::ParameterInternalization> Internalization;
+  // Pre-process the arguments, to detect identical parameters or arguments that
+  // can be constant-propagated by the JIT compiler.
+  std::vector<::jit_compiler::ParameterInternalization> InternalizeParams;
   std::vector<::jit_compiler::JITConstant> JITConstants;
+  ::jit_compiler::ParamIdentList ParamIdentities;
+  ParamList NonIdenticalParameters;
+  for (auto PI = FusedParams.begin(); PI != FusedParams.end();) {
+    PI = preProcessArguments(ArgsStorage, PI, PromotedAccs, InternalizeParams,
+                             JITConstants, NonIdenticalParameters,
+                             ParamIdentities);
+  }
 
+  // Retrieve barrier flags.
+  int BarrierFlags =
+      (PropList.has_property<ext::codeplay::property::no_barriers>()) ? -1 : 3;
+
+  static size_t FusedKernelNameIndex = 0;
+  std::stringstream FusedKernelName;
+  FusedKernelName << "fused_" << FusedKernelNameIndex++;
   auto FusedKernelInfo = ::jit_compiler::KernelFusion::fuseKernels(
-      *MJITContext, InputKernelInfo, InputKernelNames, "fused", ParamIdentities,
-      /* TODO(Lukas, ONNX-399) Use value from property */ -1, Internalization,
-      JITConstants);
+      *MJITContext, InputKernelInfo, InputKernelNames, FusedKernelName.str(),
+      ParamIdentities, BarrierFlags, InternalizeParams, JITConstants);
+
+  std::vector<ArgDesc> FusedArgs;
+  int FusedArgIndex = 0;
+  for (auto &Param : FusedParams) {
+    // Add to the argument list of the fused kernel, but with the correct
+    // new index in the fused kernel.
+    auto &Arg = Param.Arg;
+    FusedArgs.emplace_back(Arg.MType, Arg.MPtr, Arg.MSize, FusedArgIndex++);
+  }
+
+  // Update the kernel arguments for internalized accessors.
+  updatePromotedArgs(FusedKernelInfo, NDRDesc, FusedArgs, ArgsStorage);
 
   auto PIDeviceBinaries = createPIDeviceBinary(FusedKernelInfo);
   detail::ProgramManager::getInstance().addImages(PIDeviceBinaries);
@@ -205,7 +705,8 @@ jit_compiler::fuseKernels(QueueImplPtr Queue,
       CG::CGTYPE::Kernel, static_cast<int>(CG::CG_VERSION::V1)));
   std::unique_ptr<detail::CG> FusedCG;
   FusedCG.reset(new detail::CGExecKernel(
-      NDRDesc, nullptr, nullptr, std::move(KernelBundleImplPtr), std::move(ArgsStorage), std::move(AccStorage),
+      NDRDesc, nullptr, nullptr, std::move(KernelBundleImplPtr),
+      std::move(ArgsStorage), std::move(AccStorage),
       std::move(RawExtendedMembers), std::move(Requirements), std::move(Events),
       std::move(FusedArgs), FusedKernelInfo.Name, OSUtil::DummyModuleHandle, {},
       {}, CGType));
@@ -270,7 +771,7 @@ std::vector<uint8_t> jit_compiler::encodeArgUsageMask(
     // DPC++ internally uses 'true' to indicate that an argument has been
     // eliminated, while the JIT compiler uses 'true' to indicate an argument
     // is used. Translate this here.
-    if (!Mask[i]) {
+    if (!(Mask[i] & ::jit_compiler::ArgUsage::Used)) {
       uint8_t &Byte = Encoded[NBytesForSize + (i / NBitsInElement)];
       Byte |= static_cast<uint8_t>((1 << (i % NBitsInElement)));
     }

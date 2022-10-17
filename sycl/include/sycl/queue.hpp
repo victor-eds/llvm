@@ -1063,7 +1063,7 @@ public:
 
   void ext_codeplay_cancel_fusion();
 
-  event ext_codeplay_complete_fusion();
+  event ext_codeplay_complete_fusion(const property_list &PropList = {});
 
   bool ext_codeplay_is_in_fusion_mode();
 

@@ -9,8 +9,8 @@
 #include "detail/config.hpp"
 #include <detail/context_impl.hpp>
 #include <detail/event_impl.hpp>
-#include <detail/memory_manager.hpp>
 #include <detail/jit_compiler.hpp>
+#include <detail/memory_manager.hpp>
 #include <detail/queue_impl.hpp>
 #include <detail/scheduler/scheduler.hpp>
 #include <detail/sycl_mem_obj_t.hpp>
@@ -1446,7 +1446,8 @@ void Scheduler::GraphBuilder::cancelFusion(QueueImplPtr Queue,
 
 EventImplPtr
 Scheduler::GraphBuilder::completeFusion(QueueImplPtr Queue,
-                                        std::vector<Command *> &ToEnqueue) {
+                                        std::vector<Command *> &ToEnqueue,
+                                        const property_list &PropList) {
   if (!isInFusionMode(Queue->uniqueID())) {
     throw sycl::exception{
         sycl::make_error_code(sycl::errc::invalid),
@@ -1456,8 +1457,8 @@ Scheduler::GraphBuilder::completeFusion(QueueImplPtr Queue,
   auto &CmdList = (*FusionList).second;
 
   // Call the JIT compiler to perform the fusion.
-  auto FusedCG =
-      detail::jit_compiler::get_instance().fuseKernels(Queue, CmdList);
+  auto FusedCG = detail::jit_compiler::get_instance().fuseKernels(
+      Queue, CmdList, PropList);
   // Clean up the old commands after successfully fusing them.
   for (auto &OldCmd : CmdList) {
     cleanupCommand(OldCmd.release(), /* AllowUnsubmitted */ true);

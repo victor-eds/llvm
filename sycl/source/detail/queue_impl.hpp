@@ -459,6 +459,13 @@ public:
   /// \return Unique ID identifying this queue.
   QueueIdT uniqueID() { return MUniqueID; }
 
+  /// Check whether the queue is in fusion mode.
+  ///
+  /// \return true if the queue is in fusion mode, false otherwise.
+  bool is_in_fusion_mode() {
+    return detail::Scheduler::getInstance().isInFusionMode(MUniqueID);
+  }
+
 protected:
   // template is needed for proper unit testing
   template <typename HandlerType = handler>

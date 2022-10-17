@@ -458,8 +458,7 @@ MemObjRecord *Scheduler::getMemObjRecord(const Requirement *const Req) {
 }
 
 void Scheduler::cleanupCommands(const std::vector<Command *> &Cmds) {
-  if (Cmds.empty())
-  {
+  if (Cmds.empty()) {
     std::lock_guard<std::mutex> Lock{MDeferredCleanupMutex};
     if (MDeferredCleanupCommands.empty())
       return;
@@ -502,12 +501,13 @@ void Scheduler::cancelFusion(QueueImplPtr queue) {
   enqueueCommandForCG(nullptr, ToEnqueue);
 }
 
-EventImplPtr Scheduler::completeFusion(QueueImplPtr queue) {
+EventImplPtr Scheduler::completeFusion(QueueImplPtr queue,
+                                       const property_list &PropList) {
   std::vector<Command *> ToEnqueue;
   EventImplPtr FusedEvent;
   {
     WriteLockT Lock{MGraphLock, std::defer_lock};
-    FusedEvent = MGraphBuilder.completeFusion(queue, ToEnqueue);
+    FusedEvent = MGraphBuilder.completeFusion(queue, ToEnqueue, PropList);
   }
   enqueueCommandForCG(FusedEvent, ToEnqueue);
   return FusedEvent;

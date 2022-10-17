@@ -29,7 +29,7 @@ class jit_compiler {
 
 public:
   std::unique_ptr<detail::CG> fuseKernels(QueueImplPtr Queue,
-                                          FusionList &InputKernels);
+                                          FusionList &InputKernels, const property_list&);
 
   static jit_compiler &get_instance() {
     static jit_compiler instance{};
