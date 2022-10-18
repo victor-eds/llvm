@@ -458,6 +458,73 @@ class shortcuts) should abort fusion in any of the following scenarios:
 In case any of the kernels to be fused does not count with an accessible
 suitable intermediate representation, kernel fusion is canceled.
 
+=== Combining Internalization Properties
+
+In some cases, the user will specify different internalization targets for a
+buffer and accessors to such buffer. In that case, these properties must be
+combined as follows:
+
+[options="header"]
+|===
+|Accessor Internalization Target|Buffer Internalization Target|Resulting Internalization Target
+
+.3+.^|None
+|None
+|None
+
+|Local
+|Local
+
+|Private
+|Private
+
+.3+.^|Local
+|None
+|Local
+
+|Local
+|Local
+
+|Private
+|*Error*
+
+.3+.^|Private
+|None
+|Private
+
+|Local
+|*Error*
+
+|Private
+|Private
+|===
+
+In case different internalization targets are used for accessors to the same
+buffer, the following (commutative and associative) rules are followed:
+
+[options="header"]
+|===
+|Accessor~1 Internalization Target|Accessor~2 Internalization Target|Resulting Internalization Target
+
+|None
+|_Any_
+|None
+
+.2+.^|Local
+|Local
+|Local
+
+|Private
+|None
+
+|Private
+|Private
+|Private
+|===
+
+If no work-group size is specified when using local internalization for any of
+the kernels involved in the fusion, no internalization will be performed.
+
 == Design Constraints
 
 The biggest constraint for the design stems from the the fact that the
