@@ -504,7 +504,7 @@ buffer, the following (commutative and associative) rules are followed:
 
 [options="header"]
 |===
-|Accessor~1 Internalization Target|Accessor~2 Internalization Target|Resulting Internalization Target
+|Accessor~1~ Internalization Target|Accessor~2~ Internalization Target|Resulting Internalization Target
 
 |None
 |_Any_
