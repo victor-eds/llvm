@@ -701,15 +701,13 @@ jit_compiler::fuseKernels(QueueImplPtr Queue, detail::FusionList &InputKernels,
       detail::getSyclObjImpl(get_kernel_bundle<bundle_state::executable>(
           Queue->get_context(), {Queue->get_device()}, {FusedKernelId}));
 
-  auto CGType = static_cast<CG::CGTYPE>(getVersionedCGType(
-      CG::CGTYPE::Kernel, static_cast<int>(CG::CG_VERSION::V1)));
   std::unique_ptr<detail::CG> FusedCG;
   FusedCG.reset(new detail::CGExecKernel(
       NDRDesc, nullptr, nullptr, std::move(KernelBundleImplPtr),
       std::move(ArgsStorage), std::move(AccStorage),
       std::move(RawExtendedMembers), std::move(Requirements), std::move(Events),
       std::move(FusedArgs), FusedKernelInfo.Name, OSUtil::DummyModuleHandle, {},
-      {}, CGType));
+      {}, CG::CGTYPE::Kernel));
   return FusedCG;
 }
 
