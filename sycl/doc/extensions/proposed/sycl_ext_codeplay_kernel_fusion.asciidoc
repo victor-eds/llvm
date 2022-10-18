@@ -339,7 +339,6 @@ should produce the same visible results as if the kernels where executed
 regularly. Throughout this section, synchronization rules while in fusion mode
 are described. Note that some scenarios will lead to the sequential submission
 of the kernels in the fusion list, as adherence to the SYCL standard takes a
-
 higher priority than the optimization benefits brought by the kernel fusion.
 
 [NOTE]
