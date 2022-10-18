@@ -229,8 +229,8 @@ supports.
 === API Extension
 
 The design tightly integrates with the `queue` class and leverages the
-asynchronous nature of SYCL kernel submissions. It introduces one additional
-`property` and new member functions to class `queue`.
+asynchronous nature of SYCL kernel submissions. It introduces additional
+properties and new member functions to class `queue`.
 
 |===
 |Member Function|Description
