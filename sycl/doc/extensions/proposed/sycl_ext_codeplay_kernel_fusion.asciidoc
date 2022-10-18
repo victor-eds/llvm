@@ -298,7 +298,7 @@ At call completion the `queue` is no longer in "fusion mode", until the next
 |This property enables kernel fusion for the queue. If any of
  `queue::ext_codeplay_start_fusion`, `queue::ext_codeplay_cancel_fusion` or
  `queue::ext_codeplay_complete_fusion` is called on a queue without this
- property, an error is thrown.
+ property, an `exception` with `errc::invalid` error code is thrown.
 
 |`sycl::ext::codeplay::property::no_barriers`
 |If this property list passed to `queue::ext_codeplay_complete_fusion()`
@@ -461,8 +461,9 @@ suitable intermediate representation, kernel fusion is canceled.
 === Combining Internalization Properties
 
 In some cases, the user will specify different internalization targets for a
-buffer and accessors to such buffer. In that case, these properties must be
-combined as follows:
+buffer and accessors to such buffer. When incompatible combinations are used, an
+`exception` with `errc::invalid` error code is thrown. Otherwise, these
+properties must be combined as follows:
 
 [options="header"]
 |===
