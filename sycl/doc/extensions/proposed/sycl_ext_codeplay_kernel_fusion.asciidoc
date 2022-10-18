@@ -522,8 +522,12 @@ buffer, the following (commutative and associative) rules are followed:
 |Private
 |===
 
-If no work-group size is specified when using local internalization for any of
-the kernels involved in the fusion, no internalization will be performed.
+If no work-group size is specified or two accessors specify different
+work-group sizes when using local internalization for any of the
+kernels involved in the fusion, no internalization will be
+performed. If there is a mismatch between the two accessors (access
+range, access offset, number of dimensions, data type), no
+internalization is performed.
 
 == Design Constraints
 
