@@ -246,7 +246,8 @@ properties and new member functions to class `queue`.
  kernels that should be fused (i.e., to the _fusion list_) until
  `ext_codeplay_complete_fusion` or `ext_codeplay_cancel_fusion` are called.
 
-If the `queue` is already in fusion mode, the function throws an error.
+If the `queue` is already in fusion mode, the function throws an `exception`
+with `errc::invalid` error code.
 
 |`event queue::ext_codeplay_complete_fusion(const property_list &)`
 |Complete the fusion: If the runtime decides to perform fusion, it will
