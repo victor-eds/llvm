@@ -28,24 +28,22 @@
 // CHECK-LLVM-DAG: %"struct.sycl::_V1::detail::ItemBase.1.true" = type { %"class.sycl::_V1::range.1", %"class.sycl::_V1::id.1", %"class.sycl::_V1::id.1" }
 
 // CHECK-MLIR: gpu.module @device_functions
-// COM: Although this is a pointer, we are not adding pointer-specific attributes by now.
 // CHECK-MLIR-LABEL: gpu.func @_ZTS8kernel_1(
-// CHECK-MLIR-SAME:    %arg0: memref<?xi32, 1> [[SCALAR_ATTRS:{llvm.noundef}]]
+// CHECK-MLIR-SAME:    %arg0: memref<?xi32, 1> [[POINTER_ATTRS:{llvm.align = 4 : i64, llvm.noundef}]]
 // CHECK-MLIR-SAME:    %arg1: memref<?x!sycl_range_1_> [[STRUCT_ATTRS:{llvm.align = 8 : i64, llvm.byval, llvm.noundef}]]
 // CHECK-MLIR-SAME:    %arg2: memref<?x!sycl_range_1_> [[STRUCT_ATTRS]]
 // CHECK-MLIR-SAME:    %arg3: memref<?x!sycl_id_1_> [[STRUCT_ATTRS]]
-// CHECK-MLIR-SAME:    %arg4: i32 [[SCALAR_ATTRS]])
+// CHECK-MLIR-SAME:    %arg4: i32 [[SCALAR_ATTRS:{llvm.noundef}]])
 // CHECK-MLIR-SAME:  kernel attributes {[[CCONV:llvm.cconv = #llvm.cconv<spir_kernelcc>]], [[LINKAGE:llvm.linkage = #llvm.linkage<weak_odr>]],
 // CHECK-MLIR-SAME:  [[PASSTHROUGH:passthrough = \[\["sycl-module-id", ".*/polygeist/tools/cgeist/Test/Verification/sycl/kernels.cpp"\], "norecurse", "nounwind", "convergent", "mustprogress"\]]]} {
 // CHECK-MLIR-NOT: gpu.func kernel
 
-// COM: Although this is a pointer, we are not adding pointer-specific attributes by now.
 // CHECK-LLVM-LABEL: define weak_odr spir_kernel void @_ZTS8kernel_1(
-// CHECK-LLVM-SAME:    i32 addrspace(1)* [[SCALAR_ATTRS:noundef]] %0
+// CHECK-LLVM-SAME:    i32 addrspace(1)* [[POINTER_ATTRS:noundef align 4]] %0
 // CHECK-LLVM-SAME:    [[RANGE_TY:%"class.sycl::_V1::range.1"]]* noundef byval([[RANGE_TY]]) align 8 %1
 // CHECK-LLVM-SAME:    [[RANGE_TY]]* noundef byval([[RANGE_TY]]) align 8 %2
 // CHECK-LLVM-SAME:    [[ID_TY:%"class.sycl::_V1::id.1"]]* noundef byval([[ID_TY]]) align 8 %3
-// CHECK-LLVM-SAME:    i32 [[SCALAR_ATTRS]] %4
+// CHECK-LLVM-SAME:    i32 [[SCALAR_ATTRS:noundef]] %4
 // CHECK-LLVM-SAME:  ) #1
 
 class kernel_1 {
@@ -77,8 +75,7 @@ void host_1() {
   }
 }
 
-// COM: Although this is a pointer, we are not adding pointer-specific attributes by now.
-// CHECK-MLIR: gpu.func @_ZTSZZ6host_2vENKUlRN4sycl3_V17handlerEE_clES2_E8kernel_2(%arg0: memref<?xi32, 1> [[SCALAR_ATTRS]],
+// CHECK-MLIR: gpu.func @_ZTSZZ6host_2vENKUlRN4sycl3_V17handlerEE_clES2_E8kernel_2(%arg0: memref<?xi32, 1> [[POINTER_ATTRS]],
 // CHECK-MLIR-SAME:     %arg1: memref<?x!sycl_range_1_> [[STRUCT_ATTRS]],
 // CHECK-MLIR-SAME:     %arg2: memref<?x!sycl_range_1_> [[STRUCT_ATTRS]],
 // CHECK-MLIR-SAME:     %arg3: memref<?x!sycl_id_1_> [[STRUCT_ATTRS]])

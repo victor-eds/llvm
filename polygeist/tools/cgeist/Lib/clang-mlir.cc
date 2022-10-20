@@ -3383,6 +3383,13 @@ void MLIRASTConsumer::createMLIRParameterDescriptors(
         attrBuilder.addAttribute(
             llvm::Attribute::AttrKind::Alignment,
             CGM.getContext().getTypeAlignInChars(parmType).getQuantity());
+      } else if (parmType->isPointerType()) {
+        QualType PTy = parmType->getPointeeType();
+        if (!PTy->isIncompleteType() && PTy->isConstantSizeType()) {
+          attrBuilder.addAttribute(
+              llvm::Attribute::AttrKind::Alignment,
+              CGM.getContext().getTypeAlignInChars(PTy).getQuantity());
+        }
       }
 
       CodeGenUtils::ParmDesc parmDesc(ty, attrBuilder.getAttrs());
