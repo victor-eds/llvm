@@ -43,11 +43,16 @@ struct GetGlobalMemrefOpLowering
         typeConverter->convertType(memrefTy.getElementType());
     if (!convElemType)
       return failure();
+    FailureOr<unsigned> memSpaceOrError =
+        getTypeConverter()->getMemRefAddressSpace(memrefTy);
+    if (failed(memSpaceOrError))
+      return getGlobalOp.emitOpError(
+          "memory space cannot be converted to an integer address space");
+    unsigned memSpace = *memSpaceOrError;
     const auto addressOf =
         static_cast<Value>(rewriter.create<LLVM::AddressOfOp>(
             getGlobalOp.getLoc(),
-            LLVM::LLVMPointerType::get(memrefTy.getContext(),
-                                       memrefTy.getMemorySpaceAsInt()),
+            LLVM::LLVMPointerType::get(memrefTy.getContext(), memSpace),
             adaptor.getName()));
 
     // Get the address of the first element in the array by creating a GEP with
@@ -337,10 +342,15 @@ struct GetGlobalMemrefOpLoweringOld
         convertGlobalMemrefTypeToLLVM(memrefTy, *typeConverter);
     if (!arrayTy)
       return failure();
+    FailureOr<unsigned> memSpaceOrError =
+        getTypeConverter()->getMemRefAddressSpace(memrefTy);
+    if (failed(memSpaceOrError))
+      return getGlobalOp.emitOpError(
+          "memory space cannot be converted to an integer address space");
+    unsigned memSpace = *memSpaceOrError;
     const auto addressOf =
         static_cast<Value>(rewriter.create<LLVM::AddressOfOp>(
-            getGlobalOp.getLoc(),
-            LLVM::LLVMPointerType::get(arrayTy, memrefTy.getMemorySpaceAsInt()),
+            getGlobalOp.getLoc(), LLVM::LLVMPointerType::get(arrayTy, memSpace),
             adaptor.getName()));
 
     // Get the address of the first element in the array by creating a GEP with
